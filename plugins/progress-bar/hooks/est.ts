@@ -6,8 +6,11 @@
  *  1. 速率:指數權重的 local linear regression(單邊核,只用過去的讀數),遞迴更新六個統計量。
  *  2. 目標:以最後一個真實讀數為錨往前外插,外插會飽和、最多領先一個典型步幅 —— 顯示值不能往回,
  *     寧可落後(追得回來)也不要超前(收不回來)。
- *  3. 控制器:顯示值只增不減;落後時加快、超前時變慢但不停。
+ *  3. 控制器:顯示值跟著目標的速度走(目標飽和了就幾乎停下),落後時追趕、超前時指數地變慢;
+ *     最低速度是剩下距離的 1/3600 每秒 —— 只增不減、不停,但讀數停住時不會一路衝上去。
  */
+
+import type { Fit } from '../types'
 
 // ── 參數:手感要調只改這裡 ──
 export const CAP = 99.5            // 任務結束前的上限(%)
@@ -17,9 +20,8 @@ const H_FIRST = 30                 // 讀數間隔還不知道時的帶寬(秒)
 const H_GAPS = 3                   // 帶寬 = 3 × 讀數間隔
 const PRIOR_WEIGHT = 2             // 歷史速率的先驗強度(相當於幾個讀數)
 const FLOOR_FRAC = 0.2             // 速率下限 = 0.2 × 平均速率
-const GAIN = 3                     // 增益尺度(百分點):差 3 點,速度 ×e
-const V_LO = 0.1                   // 超前時速度最少是估計速率的幾倍
-const V_HI = 4                     // 落後時(倍率那一項)最多幾倍
+const GAIN = 3                     // 增益尺度(百分點):超前 3 點,速度 ×1/e
+const CREEP_S = 3600               // 最低速度 = (CAP − d) / 3600 每秒
 const CATCH_S = 0.75               // 落後時追趕的時間常數(秒)
 const SNAP = 0.05                  // 差不到這麼多就直接貼上目標(百分點)
 const TAU_MIN = 5                  // 外插飽和的時間常數下限(秒)
@@ -28,20 +30,8 @@ const EW = 0.3                     // 讀數間隔、步幅的 EW 平均係數
 const MAX_RUNS = 5                 // 每個指令留幾次的長度
 const MAX_COMMANDS = 200           // 最多記幾個指令
 
-/** 指數權重 local linear 的狀態。原點放在最後一個讀數(`tLast`),所以 `s1` ≤ 0。 */
-export type Fit = {
-  s0: number    // Σw
-  s1: number    // Σw·t
-  s2: number    // Σw·t²
-  sy: number    // Σw·p
-  sty: number   // Σw·t·p
-  sww: number   // Σw²(算有效樣本數)
-  tLast: number // 最後一個讀數的時間(秒)
-  pLast: number // 最後一個讀數(%)
-  gap: number | null  // 讀數間隔的 EW 平均(秒)
-  step: number | null // 每次讀數增加量的 EW 平均(百分點)
-  carry: number | null // 換階段時從上一段帶過來的速率
-}
+// 指數權重 local linear 的狀態放在 state 裡,型別由 contract 定義;原點放在最後一個讀數(`tLast`),所以 `s1` ≤ 0。
+export type { Fit }
 
 export type Eval = { level: number; slope: number | null; nEff: number }
 
@@ -109,11 +99,22 @@ export function rate(ev: Eval | null, prior: number | null, avg: number | null, 
  * 最多領先一個典型步幅(且不超過 `MAX_LEAD`),不超過 `CAP`。讀數該來沒來,外插就平了。
  */
 export function target(fit: Fit, t: number, b: number | null): number {
+  const { ext, lead } = extrapolation(fit, t, b)
+  return Math.min(fit.pLast + Math.min(ext, lead), CAP)
+}
+
+/** 目標值每秒走幾個百分點:外插還沒到領先上限(與 `CAP`)時是 `b·e^{−Δ/τ}`,到了就是 0。 */
+export function targetRate(fit: Fit, t: number, b: number | null): number {
+  const { ext, lead, decay } = extrapolation(fit, t, b)
+  if (b === null || ext >= lead || fit.pLast + ext >= CAP) return 0
+  return b * decay
+}
+
+function extrapolation(fit: Fit, t: number, b: number | null): { ext: number; lead: number; decay: number } {
   const dt = Math.max(0, t - fit.tLast)
   const tau = Math.max(TAU_MIN, 2 * (fit.gap ?? H_FIRST / 2))
-  const ext = b === null ? 0 : b * tau * (1 - Math.exp(-dt / tau))
-  const lead = Math.min(fit.step ?? MAX_LEAD, MAX_LEAD)
-  return Math.min(fit.pLast + Math.min(ext, lead), CAP)
+  const decay = Math.exp(-dt / tau)
+  return { ext: b === null ? 0 : b * tau * (1 - decay), lead: Math.min(fit.step ?? MAX_LEAD, MAX_LEAD), decay }
 }
 
 /** 只有歷史、沒有讀數時的目標:經過時間 ÷ 歷史長度。 */
@@ -122,18 +123,18 @@ export function targetByTime(elapsed: number, total: number): number {
 }
 
 /**
- * 控制器的一步:顯示值 `d` 經過 `dt` 秒之後。只增不減、不超過 `CAP`。
- * 有速率時以 `b · clamp(e^{g/GAIN}, V_LO, V_HI)` 前進(超前也不停);落後時另有追趕項,
- * 每 `dt` 補上差距的 `1 − e^{−dt/CATCH_S}`,取兩者較快的。沒有速率時只追到目標為止。
+ * 控制器的一步:顯示值 `d` 經過 `dt` 秒之後,`vt` 是目標的速度(百分點 / 秒)。只增不減、不超過 `CAP`。
+ *  - 落後:跟著目標走,另外每 `dt` 補上差距的 `1 − e^{−dt/CATCH_S}`(差一點點就直接貼上)。
+ *  - 超前:目標的速度乘上 `e^{g/GAIN}`,超前越多越慢。
+ *  - 最低速度 `(CAP − d) / CREEP_S`:不停,但讀數停住十分鐘,50% 附近只會多走約 8 個百分點。
  */
-export function step(d: number, tgt: number, b: number | null, dt: number): number {
+export function step(d: number, tgt: number, vt: number, dt: number): number {
   const g = tgt - d
-  let next = d
-  if (b !== null) next = d + b * clamp(Math.exp(g / GAIN), V_LO, V_HI) * dt
-  if (g > 0) {
-    next = Math.max(next, d + g * (1 - Math.exp(-dt / CATCH_S)))
-    if (tgt - next < SNAP && tgt - next > 0) next = tgt
-  }
+  let next = g > 0
+    ? d + vt * dt + g * (1 - Math.exp(-dt / CATCH_S))
+    : d + vt * Math.exp(g / GAIN) * dt
+  if (g > 0 && tgt - next > 0 && tgt - next < SNAP) next = tgt
+  next = Math.max(next, d + ((CAP - d) / CREEP_S) * dt)
   return Math.max(d, Math.min(CAP, next))
 }
 

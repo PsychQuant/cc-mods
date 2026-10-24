@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { CAP, fitAdd, fitEval, lookup, median, rate, record, step, target } from '../hooks/est'
+import { CAP, fitAdd, fitEval, lookup, median, rate, record, step, target, targetRate } from '../hooks/est'
 import type { Fit } from '../hooks/est'
 
 /** 固定種子的亂數(mulberry32):每次跑都是同一串 */
@@ -76,24 +76,33 @@ describe('目標值:以最後讀數為錨,外插會飽和', () => {
 })
 
 describe('控制器', () => {
-  test('落後時加快(倍率不超過 4、差距很大時快速追上),超前時變慢但不停', () => {
-    const b = 1
-    const behind = step(50, 60, b, 0.25) - 50
-    const even = step(50, 50, b, 0.25) - 50
-    const ahead = step(60, 50, b, 0.25) - 60
+  test('跟著目標的速度走:落後時追趕、超前時變慢但不停', () => {
+    const vt = 1                                            // 目標每秒走 1 個百分點
+    const behind = step(50, 60, vt, 0.25) - 50
+    const even = step(50, 50, vt, 0.25) - 50
+    const ahead = step(60, 50, vt, 0.25) - 60
     expect(behind > even).toBe(true)
     expect(Math.abs(even - 0.25) < 1e-12).toBe(true)
     expect(ahead > 0 && ahead < even).toBe(true)
-    expect(ahead >= 0.1 * 0.25 - 1e-12).toBe(true)
-    // 差距很大:不靠倍率,用追趕項在幾秒內接近
+    // 差距很大:追趕項在幾秒內接近
     let d = 0
-    for (let i = 0; i < 12; i++) d = step(d, 63, null, 0.25)
-    expect(d > 60 && d <= 63).toBe(true)
+    for (let i = 0; i < 12; i++) d = step(d, 63, 0, 0.25)
+    expect(d > 60 && d <= 63.01).toBe(true)
   })
 
-  test('沒有速率、已經到目標:停在目標(不往前猜,也不往回)', () => {
-    expect(step(63, 63, null, 0.25)).toBe(63)
-    expect(step(70, 63, null, 0.25)).toBe(70)
+  test('目標不動:仍以極慢的速度前進(不停,也不往回),一拍不到 0.01', () => {
+    const at = step(63, 63, 0, 0.25) - 63
+    const over = step(70, 63, 0, 0.25) - 70
+    expect(at > 0 && at < 0.01).toBe(true)
+    expect(over > 0 && over < 0.01).toBe(true)
+  })
+
+  test('早期速率很高、目標已經飽和:顯示值不會衝過目標(超前收不回來)', () => {
+    const fit = fitOf([[0, 0], [2, 42]])                    // 兩個點:斜率 21%/s,步幅上限 10
+    const b = rate(fitEval(fit), null, 21, null) ?? NaN
+    let d = 0
+    for (let t = 2.25; t <= 6; t += 0.25) d = step(d, target(fit, t, b), targetRate(fit, t, b), 0.25)
+    expect(d > 50 && d < 52.5).toBe(true)
   })
 
   test('任意讀數序列(含往回掉):顯示值單調不減、不超過上限(結束前不到 100%)、執行中一直在動', () => {
@@ -114,7 +123,7 @@ describe('控制器', () => {
       if (fit === null) continue
       const b = rate(fitEval(fit), null, null, null) ?? 0.05
       const before = d
-      d = step(d, target(fit, t, b), b, dt)
+      d = step(d, target(fit, t, b), targetRate(fit, t, b), dt)
       expect(d >= before).toBe(true)
       expect(d <= CAP).toBe(true)
       if (before < CAP) expect(d > before).toBe(true)

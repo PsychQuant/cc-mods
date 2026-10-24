@@ -1,5 +1,6 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from '../hooks/parse'
 
@@ -84,6 +85,10 @@ const engineDraws = (on: On) =>
 const OUTPUT = '/tmp/tasks/b1.output'
 const LOG = '/jobs/1/tmp/pytest.log'
 
+/** 一列畫出來的百分比(一位小數);沒有就是 NaN */
+const shownPct = (text: string): number => Number(/(\d+\.\d)%/.exec(text)?.[1] ?? NaN)
+const SPINNER = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] /
+
 test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收起', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   engineDraws(on)
@@ -112,11 +117,13 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
   log += 'tests/a.py ....  [ 42%]\n'
   mtime = 2
   await clock.advance(2000)
+  await clock.advance(3000)    // 顯示值追上讀數(顯示時鐘每 250 ms 一拍)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
-    expect(text).toContain('42%')
+    // 追上了讀數,最多再領先一個典型步幅(上限 10 個百分點)
+    expect(shownPct(text) >= 42 && shownPct(text) <= 52).toBe(true)
     expect(text).toContain('█')
     // 疊在下面的東西照樣畫(同一條 band 上的其他 mod 不被蓋掉)
     expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
@@ -187,12 +194,16 @@ test('已經在跑的背景 shell:每一輪結束時接上,讀它重導向的檔
     ],
   })
   await clock.advance(2000)
+  await clock.advance(6000)    // 顯示值追上讀數
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /Old pytest run/ }))?.text ?? '').toContain('63%')
-  // 不是 shell 的背景工作也顯示一列:名字與經過時間,沒有長條
+  // 接上的任務沒有開始時間、只有一個讀數:追到讀數就停在那裡(不往前猜)
+  const old = (await ui.find({ type: 'Text', text: /Old pytest run/ }))?.text ?? ''
+  expect(Math.abs(shownPct(old) - 63) < 0.6).toBe(true)
+  // 不是 shell 的背景工作也顯示一列:轉圈、名字與經過時間,沒有長條
   const agent = (await ui.find({ type: 'Text', text: /Some agent/ }))?.text ?? ''
-  expect(agent.startsWith('⋯ Some agent')).toBe(true)
+  expect(SPINNER.test(agent) && agent.includes('Some agent')).toBe(true)
+  expect(agent.includes('▕')).toBe(false)
   await ui.unmount()
 
   // 下一輪結束時清單裡沒有了:當作結束(沒有結束通知也收得起來),15 秒後收起
@@ -227,8 +238,138 @@ test('沒有重導向的 shell:從學到的輸出資料夾讀 <id>.output', asyn
     background_tasks: [{ id: 'b7', type: 'shell', status: 'running', description: 'Download data', command: 'curl -O https://example.com/data.zip' }],
   })
   await clock.advance(2000)
+  await clock.advance(6000)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /Download data/ }))?.text ?? '').toContain('37%')
+  const text = (await ui.find({ type: 'Text', text: /Download data/ }))?.text ?? ''
+  expect(Math.abs(shownPct(text) - 37) < 0.6).toBe(true)
   await ui.unmount()
+})
+
+const ended = (id: string, status = 'completed') => ({
+  message: {
+    type: 'user',
+    role: 'user',
+    isMeta: true,
+    content: [{ type: 'text', text: `<task-notification><task-id>${id}</task-id><status>${status}</status></task-notification>` }],
+  },
+  door: 'main',
+  origin: { kind: 'task-notification' },
+  uuid: `u-${id}`,
+}) as never
+
+const background = (on: On, id: () => string) =>
+  on('tool.call', () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id() },
+    text: `Command running in background with ID: ${id()}. Output is being written to: /tmp/tasks/${id()}.output. You will be notified.`,
+  }))
+
+/** 這個 test 自己的 store:看得到 mod 寫了什麼 */
+function memoryStore(on: On): Record<string, unknown> {
+  const mem: Record<string, unknown> = {}
+  on('store.get', (_, e) => ({ value: mem[e.key] }))
+  on('store.set', (_, e) => {
+    mem[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  return mem
+}
+
+const rowText = async ($: Engine, label: RegExp): Promise<string> => {
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const text = (await ui.find({ type: 'Text', text: label }))?.text ?? ''
+  await ui.unmount()
+  return text
+}
+
+test('兩次讀數之間百分比照樣往前走,不超過最後讀數加一個步幅', async ($, on) => {
+  const clock = mock.clock(on, { now: 2_000_000 })
+  engineDraws(on)
+  mock.env(on, { HOME: '/Users/me', CLAUDE_JOB_DIR: '/jobs/1' })
+  let log = ''
+  let mtime = 0
+  on('fs.stat', (_, e) => (e.path === LOG ? fileStat(Math.max(1, log.length), mtime) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === LOG ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'b2')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'pytest -q > $CLAUDE_JOB_DIR/tmp/pytest.log 2>&1', description: 'Steady run', run_in_background: true })
+
+  // 第 10 秒讀到 10%、第 20 秒讀到 20%(每 2 秒讀一次檔)
+  await clock.advance(8000)
+  log = 'a ....  [ 10%]\n'
+  mtime = 1
+  await clock.advance(2000)
+  await clock.advance(8000)
+  log += 'b ....  [ 20%]\n'
+  mtime = 2
+  await clock.advance(2000)
+
+  await clock.advance(4000)                 // 之後沒有新讀數
+  const first = await rowText($, /Steady run/)
+  await clock.advance(4000)
+  const second = await rowText($, /Steady run/)
+  expect(shownPct(first) > 20).toBe(true)
+  expect(shownPct(second) > shownPct(first)).toBe(true)
+  expect(shownPct(second) <= 30).toBe(true)
+  expect(second).toContain('還要')
+})
+
+test('跑完的時間記進 store;同一個指令字串下次沒有讀數也有百分比與還要多久', async ($, on) => {
+  const clock = mock.clock(on, { now: 3_000_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let id = 'h1'
+  background(on, () => id)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  // 第一次:沒有歷史 → 轉圈
+  await $.tool.call({ tool: 'Bash', command: 'make build', description: 'Build it', run_in_background: true })
+  await clock.advance(1000)
+  expect(SPINNER.test(await rowText($, /Build it/))).toBe(true)
+  await clock.advance(29_000)
+  await $.session.append(ended('h1'))
+  const stored = mem['history-1'] as Record<string, { runs: number[] }> | undefined
+  expect(stored?.['make build']?.runs).toEqual([30_000])
+
+  // 第二次:同一個指令字串,依經過時間畫長條
+  await clock.advance(20_000)               // 第一列收起
+  id = 'h2'
+  await $.tool.call({ tool: 'Bash', command: 'make build', description: 'Build again', run_in_background: true })
+  await clock.advance(15_000)
+  const text = await rowText($, /Build again/)
+  expect(Math.abs(shownPct(text) - 50) < 3).toBe(true)
+  expect(text).toContain('還要 15s')
+})
+
+test('沒有百分比也沒有歷史:轉圈隨時鐘前進;任務結束後清空顯示值、顯示時鐘停下', async ($, on) => {
+  const clock = mock.clock(on, { now: 4_000_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's1')
+  const writes: unknown[] = []
+  on('state.set', ($, e, next) => {
+    if (e.plugin === 'progress-bar' && e.key === 'shown') writes.push(e.value)
+    return next(e)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 60', description: 'Just wait', run_in_background: true })
+
+  await clock.advance(250)
+  const a = (await rowText($, /Just wait/)).slice(0, 1)
+  await clock.advance(250)
+  const b = (await rowText($, /Just wait/)).slice(0, 1)
+  expect(SPINNER.test(`${a} `) && SPINNER.test(`${b} `)).toBe(true)
+  expect(a === b).toBe(false)
+
+  await $.session.append(ended('s1'))
+  await clock.advance(1000)
+  // shape 版本的 atom 存成 { shape, value }
+  expect((writes.at(-1) as { value?: unknown } | undefined)?.value).toEqual({})
+  const count = writes.length
+  await clock.advance(3000)
+  expect(writes.length).toBe(count)
 })
