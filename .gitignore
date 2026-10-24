@@ -1,0 +1,2 @@
+# 引擎載入 mod 時寫的型別檔,每次重產
+plugins/*/.claude-plugin/types/

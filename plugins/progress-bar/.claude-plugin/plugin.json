@@ -1,0 +1,11 @@
+{
+  "name": "progress-bar",
+  "version": "0.1.1",
+  "description": "背景跑的指令(pytest、安裝、下載)在提示列上方顯示進度條:從輸出檔讀最後一個百分比,沒有百分比就顯示最後一行與經過時間",
+  "author": {
+    "name": "Che Cheng"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/PsychQuant/cc-mods"
+}
