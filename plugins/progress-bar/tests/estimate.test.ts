@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  addRun, asEntry, CAP, entryMedian, etaFromReading, evictKeys, fitAdd, fitEval, frameDt, hashCommand, MAX_LEAD, median,
-  rate, step, target, targetRate,
+  asRun, CAP, etaFromReading, expiredKeys, evictRunKeys, fitAdd, fitEval, frameDt, hashCommand, MAX_LEAD, median, parseRunKey,
+  rate, runKey, seedDisplay, step, summarize, target, targetRate,
 } from '../hooks/est'
 import type { Fit } from '../hooks/est'
 
@@ -79,14 +79,14 @@ describe('目標值:以最後讀數為錨,外插會飽和', () => {
 })
 
 describe('控制器', () => {
-  test('跟著目標的速度走:落後時追趕、超前時變慢但不停', () => {
+  test('落後時一階延遲追這一拍的目標;剛好在目標上只剩最低速度;超前時照目標的速度變慢但不停', () => {
     const vt = 1                                            // 目標每秒走 1 個百分點
     const behind = step(50, 60, vt, 0.25) - 50
     const even = step(50, 50, vt, 0.25) - 50
     const ahead = step(60, 50, vt, 0.25) - 60
-    expect(behind > even).toBe(true)
-    expect(Math.abs(even - 0.25) < 1e-12).toBe(true)
-    expect(ahead > 0 && ahead < even).toBe(true)
+    expect(Math.abs(behind - 10 * (1 - Math.exp(-0.25 / 0.75))) < 1e-12).toBe(true)
+    expect(Math.abs(even - ((CAP - 50) / 3600) * 0.25) < 1e-12).toBe(true)   // 不另外加目標的移動(verify R2 #3)
+    expect(ahead > 0 && ahead < vt * 0.25).toBe(true)
     // 差距很大:追趕項在幾秒內接近
     let d = 0
     for (let i = 0; i < 12; i++) d = step(d, 63, 0, 0.25)
@@ -162,12 +162,29 @@ describe('長間隔與時間倒退(cc-mods#1 verify R1 #7、#20)', () => {
     expect(etaFromReading(50, 0)).toBe(null)
   })
 
+  test('落後時只追到目標,不另外加上目標的移動(verify R2 #3:原本 step(0, 1, 10, 0.5) ≈ 5.5)', () => {
+    for (const [d, tgt, vt, dt] of [[0, 1, 10, 0.5], [40, 41, 50, 0.5], [10, 60, 2, 0.25], [0, 99.5, 30, 0.5]] as const) {
+      const n = step(d, tgt, vt, dt)
+      expect(n <= tgt + ((CAP - d) / 3600) * dt + 1e-9).toBe(true)
+      expect(n > d).toBe(true)
+    }
+  })
+
+  test('顯示值的初值:依讀數的那一支取讀數,依時間的那一支不取(verify R2 #4);一律不超過上限', () => {
+    expect(seedDisplay(undefined, 42, false)).toBe(42)
+    expect(seedDisplay(50, 42, false)).toBe(50)
+    expect(seedDisplay(undefined, 100, true)).toBe(0)
+    expect(seedDisplay(12, 100, true)).toBe(12)
+    expect(seedDisplay(undefined, 100, false)).toBe(CAP)
+    expect(seedDisplay(undefined, null, false)).toBe(0)
+  })
+
   test('MAX_LEAD 有匯出,測試的上界跟著它', () => {
     expect(MAX_LEAD > 0).toBe(true)
   })
 })
 
-describe('歷史(雜湊鍵、每個指令一筆)', () => {
+describe('歷史(每次跑完一個 store 鍵,不覆寫)', () => {
   test('中位數', () => {
     expect(median([3, 1, 2])).toBe(2)
     expect(median([4, 1, 3, 2])).toBe(2.5)
@@ -180,30 +197,37 @@ describe('歷史(雜湊鍵、每個指令一筆)', () => {
     expect(hashCommand('curl -H "Authorization: Bearer secret" https://x')).toBe(a)
     expect(hashCommand('curl -H "Authorization: Bearer secret" https://x ')).not.toBe(a)
     expect(a.includes('secret')).toBe(false)
-    expect(hashCommand('')).toBe(hashCommand(''))
   })
 
-  test('每個指令只留最近 5 次;中位數;分段只要有一次就記著', () => {
-    let e = null as ReturnType<typeof addRun> | null
-    for (const [i, ms] of [10, 20, 30, 40, 50, 60].entries()) e = addRun(e, ms, i, i === 2)
-    expect(e?.runs).toEqual([20, 30, 40, 50, 60])
-    expect(entryMedian(e)).toBe(40)
-    expect(e?.phased).toBe(true)
-    expect(entryMedian(null)).toBe(null)
+  test('每次跑完一個鍵:鍵裡有雜湊與時間,讀得回來;別的字串不是歷史的鍵', () => {
+    const h = hashCommand('make build')
+    const k = runKey(h, 1_700_000_000_000, 'ab12')
+    expect(k).toBe(`h3:${h}:1700000000000:ab12`)
+    expect(parseRunKey(k)).toEqual({ hash: h, at: 1_700_000_000_000 })
+    expect(parseRunKey('history-1')).toBe(null)
+    expect(parseRunKey('h3:zz:1:x')).toBe(null)
   })
 
-  test('讀回時驗證形狀;90 天沒寫入的當作沒有', () => {
-    const now = 100 * 86_400_000
-    expect(asEntry({ runs: [1000, 'x', -5], at: now, phased: true }, now)).toEqual({ runs: [1000], at: now, phased: true })
-    expect(asEntry({ runs: [1000], at: now - 91 * 86_400_000, phased: false }, now)).toBe(null)
-    expect(asEntry({ runs: [], at: now }, now)).toBe(null)
-    expect(asEntry('nope', now)).toBe(null)
-    expect(asEntry({ runs: [1000], at: now }, now)?.phased).toBe(false)
+  test('彙總:取最近 5 次的中位數;分段只要有一次就記著;值的形狀不對的丟掉', () => {
+    const runs = [10, 20, 30, 40, 50, 60].map((ms, i) => ({ at: i, ms, phased: i === 2 }))
+    expect(summarize(runs)).toEqual({ prior: 40, phased: true })
+    expect(summarize([])).toEqual({ prior: null, phased: false })
+    expect(asRun({ ms: 1000, phased: true })).toEqual({ ms: 1000, phased: true })
+    expect(asRun({ ms: -1 })).toBe(null)
+    expect(asRun('x')).toBe(null)
+    expect(asRun({ ms: 5 })?.phased).toBe(false)
   })
 
-  test('超過 200 個指令:淘汰最久沒寫入的', () => {
-    const ats = Array.from({ length: 203 }, (_, i) => [`h2:${i}`, i] as [string, number])
-    expect(evictKeys(ats)).toEqual(['h2:0', 'h2:1', 'h2:2'])
-    expect(evictKeys(ats.slice(0, 200))).toEqual([])
+  test('過期與淘汰只看鍵名:90 天前的刪;每個指令留最近 5 次;最多 200 個指令', () => {
+    const day = 86_400_000
+    const now = 200 * day
+    const h = hashCommand('a')
+    const keys = [runKey(h, now - 91 * day, '0'), runKey(h, now - day, '1'), 'history-1', 'other']
+    expect(expiredKeys(keys, now)).toEqual([runKey(h, now - 91 * day, '0')])
+    const seven = Array.from({ length: 7 }, (_, i) => runKey(h, now - (10 - i) * day, String(i)))
+    expect(evictRunKeys(seven).sort()).toEqual(seven.slice(0, 2).sort())
+    const many = Array.from({ length: 203 }, (_, i) => runKey(hashCommand(`c${i}`), i + 1, 'x'))
+    expect(evictRunKeys(many).sort()).toEqual(many.slice(0, 3).sort())
+    expect(evictRunKeys(many.slice(0, 200))).toEqual([])
   })
 })

@@ -60,10 +60,29 @@ export type Tracked = {
   status: string | null
   /** 只是從背景清單推定結束,還沒收到結束通知 */
   presumed: boolean
-  /** 已經寫進歷史 */
-  recorded: boolean
   /** 結束那一刻畫面上的顯示值;沒有是 null */
   final: number | null
+}
+
+/**
+ * 一次跑完、還沒寫進歷史的長度。與顯示的任務清單分開放:任務結束 15 秒後就從畫面收起,
+ * 晚到的結束通知仍找得到這一筆(verify R2 #3)。
+ */
+export type Pending = {
+  /** 背景任務的 id */
+  id: string
+  /** 指令字串的雜湊 */
+  key: string
+  /** 長度(ms):開始到最早得知結束的那一刻(推定結束或結束通知);沒有引擎的完成時間,是估計 */
+  ms: number
+  /** 這一次讀數往回掉過 */
+  phased: boolean
+  /** 結束通知的狀態;推定結束、還沒等到通知是 null */
+  status: string | null
+  /** 得知結束的時間(epoch ms):沒等到通知的,過一段時間丟掉 */
+  at: number
+  /** 寫入 store 失敗過幾次 */
+  tries: number
 }
 
 /** 畫面上的顯示值(每 250 ms 由顯示時鐘算出;畫出來的字串變了才寫)。 */
@@ -87,6 +106,7 @@ declare module 'claude-code' {
       now: number
       outputDir: string | null
       shown: Shaped<Record<string, Shown>>
+      pending: Shaped<Pending[]>
     }
   }
 }

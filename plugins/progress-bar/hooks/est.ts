@@ -6,7 +6,7 @@
  *  1. 速率:指數權重的 local linear regression(單邊核,只用過去的讀數),遞迴更新六個統計量。
  *  2. 目標:以最後一個真實讀數為錨往前外插,外插會飽和、最多領先一個典型步幅 —— 顯示值不能往回,
  *     寧可落後(追得回來)也不要超前(收不回來)。
- *  3. 控制器:顯示值跟著目標的速度走(目標飽和了就幾乎停下),落後時追趕、超前時指數地變慢;
+ *  3. 控制器:落後時以一階延遲追這一拍結束時的目標,超前時跟著目標的速度、超前越多越慢;
  *     最低速度是剩下距離的 1/3600 每秒 —— 只增不減、不停,但讀數停住時不會一路衝上去。
  */
 
@@ -29,7 +29,7 @@ export const MAX_LEAD = 10         // 領先最後讀數最多幾個百分點
 const EW = 0.3                     // 讀數間隔、步幅的 EW 平均係數
 const MAX_RUNS = 5                 // 每個指令留幾次的長度
 const MAX_COMMANDS = 200           // 最多記幾個指令
-const MAX_AGE_MS = 90 * 86_400_000 // 90 天沒寫入的歷史當作沒有
+const MAX_AGE_MS = 90 * 86_400_000 // 90 天前的歷史刪掉
 const MAX_DT_S = 0.5               // 每拍的 dt 上限(秒):兩拍隔很久時只會落後,不會超前(verify R1 #7)
 
 // 指數權重 local linear 的狀態放在 state 裡,型別由 contract 定義;原點放在最後一個讀數(`tLast`),所以 `s1` ≤ 0。
@@ -126,19 +126,35 @@ export function targetByTime(elapsed: number, total: number): number {
 }
 
 /**
- * 控制器的一步:顯示值 `d` 經過 `dt` 秒之後,`vt` 是目標的速度(百分點 / 秒)。只增不減、不超過 `CAP`。
- *  - 落後:跟著目標走,另外每 `dt` 補上差距的 `1 − e^{−dt/CATCH_S}`(差一點點就直接貼上)。
- *  - 超前:目標的速度乘上 `e^{g/GAIN}`,超前越多越慢。
- *  - 最低速度 `(CAP − d) / CREEP_S`:不停,但讀數停住十分鐘,50% 附近只會多走約 8 個百分點。
+ * 控制器的一步:顯示值 `d` 經過 `dt` 秒之後;`tgt` 是這一拍結束時的目標,`vt` 是目標的速度(百分點 / 秒)。
+ * 只增不減、不超過 `CAP`(輸入先夾進 [0, CAP])。
+ *  - 落後:補上差距的 `1 − e^{−dt/CATCH_S}`(一階延遲,差一點點就直接貼上)。`tgt` 已經含這一拍目標的移動,
+ *    不另外加 `vt·dt` —— 否則高速率、小差距時一拍就越過目標(verify R2 #3:原本 step(0, 1, 10, 0.5) ≈ 5.5)。
+ *    目標以等速前進時,顯示值落後約 `vt · CATCH_S`。
+ *  - 剛好在目標上:不動(只剩最低速度)—— 下一拍目標往前了,就回到落後那一支。
+ *  - 超前:目標的速度乘上 `e^{g/GAIN}`,超前越多越慢(目標往回跳到新讀數之後,顯示值不凍住)。
+ *  - 最低速度 `(CAP − d) / CREEP_S`:不停,但讀數停住十分鐘,50% 附近只會多走約 8 個百分點;只有這一項會越過目標,
+ *    每拍最多 `(CAP − d) · dt / CREEP_S`。
  */
 export function step(d: number, tgt: number, vt: number, dt: number): number {
-  const g = tgt - d
-  let next = g > 0
-    ? d + vt * dt + g * (1 - Math.exp(-dt / CATCH_S))
-    : d + vt * Math.exp(g / GAIN) * dt
-  if (g > 0 && tgt - next > 0 && tgt - next < SNAP) next = tgt
-  next = Math.max(next, d + ((CAP - d) / CREEP_S) * dt)
-  return Math.max(d, Math.min(CAP, next))
+  const cur = clamp(d, 0, CAP)
+  const g = tgt - cur
+  let next = g > 0 ? cur + g * (1 - Math.exp(-dt / CATCH_S))
+    : g < 0 ? cur + vt * Math.exp(g / GAIN) * dt
+    : cur
+  if (g > 0 && tgt - next < SNAP) next = tgt
+  next = Math.max(next, cur + ((CAP - cur) / CREEP_S) * dt)
+  return Math.max(cur, Math.min(CAP, next))
+}
+
+/**
+ * 顯示值的初值(這個任務的列還沒有長條顯示值時,或剛從轉圈變成長條時):
+ *  - 依讀數:上次顯示值與讀數的較大者 —— 剛讀到時畫讀數(verify R1 #12)。
+ *  - 依經過時間:只延續上次的顯示值,沒有就從 0 —— 分段指令的讀數是「這一段」的,不能拿來當整體進度(verify R2 #4)。
+ * 一律夾進 [0, CAP]。
+ */
+export function seedDisplay(prev: number | undefined, reading: number | null, timeMode: boolean): number {
+  return clamp(timeMode ? (prev ?? 0) : Math.max(prev ?? 0, reading ?? 0), 0, CAP)
 }
 
 /** 這一拍的 dt(秒):`fromMs` 到 `toMs`,上限 `MAX_DT_S`、下限 0。 */
@@ -152,15 +168,17 @@ export function etaFromReading(pLast: number, b: number): number | null {
   return b > 0 && v > 0 ? v : null
 }
 
-// ── 歷史:完全相同的指令字串 → 最近幾次跑完的長度(ms)。store 裡只存字串的雜湊,不存原字串(verify R1 #11);
-//    每個指令一個 store 鍵,不同指令並發完成時不會互相覆蓋(R1 #4)
+// ── 歷史:完全相同的指令字串 → 最近幾次跑完的長度(ms)。store 裡只存字串的雜湊,不存原字串(verify R1 #11)。
+//    每次跑完寫一個新鍵 `h3:<雜湊>:<時間>:<隨機>`,值是 `{ms, phased}`:只新增、不讀改寫,同一個指令同時跑完兩次
+//    也不會互蓋;過期與淘汰只看鍵名,淘汰只刪「比留下的都舊」的鍵,跟並發的寫入不衝突(verify R2 #1、#2) ──
 
-export type Entry = { runs: number[]; at: number; phased: boolean }
-export const HISTORY_PREFIX = 'h2:'
+export const HISTORY_PREFIX = 'h3:'
+export type Run = { ms: number; phased: boolean }
 
 const FNV_OFFSET = 0xcbf29ce484222325n
 const FNV_PRIME = 0x100000001b3n
 const MASK64 = (1n << 64n) - 1n
+const RUN_KEY = /^h3:([0-9a-f]{16}):(\d+):[0-9a-z]+$/
 
 /** 64 位元 FNV-1a(逐個 UTF-16 code unit):同一字串同一雜湊;16 位十六進位。 */
 export function hashCommand(command: string): string {
@@ -178,26 +196,49 @@ export function median(xs: readonly number[]): number | null {
   return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2
 }
 
-/** 加一次跑完的長度:留最近 5 次;分段只要有一次就記著。不改動 `prev`。 */
-export function addRun(prev: Entry | null, ms: number, now: number, phased: boolean): Entry {
-  return { runs: [...(prev?.runs ?? []), ms].slice(-MAX_RUNS), at: now, phased: phased || (prev?.phased ?? false) }
+/** 一次跑完的鍵。`nonce` 是 [0-9a-z]+,讓同一毫秒跑完的兩次不撞鍵。 */
+export function runKey(hash: string, at: number, nonce: string): string {
+  return `${HISTORY_PREFIX}${hash}:${at}:${nonce}`
 }
 
-export function entryMedian(e: Entry | null): number | null {
-  return e === null ? null : median(e.runs)
+/** 歷史的鍵 → 雜湊與時間;不是歷史的鍵(舊版的 `history-1`、`h2:` …)是 null。 */
+export function parseRunKey(k: string): { hash: string; at: number } | null {
+  const m = RUN_KEY.exec(k)
+  return m === null ? null : { hash: m[1]!, at: Number(m[2]) }
 }
 
-/** 讀回 store 的值:形狀不對、或 90 天沒寫入,都當作沒有。 */
-export function asEntry(v: unknown, now: number): Entry | null {
+/** 讀回 store 的值:形狀不對是 null。 */
+export function asRun(v: unknown): Run | null {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return null
-  const { runs, at, phased } = v as { runs?: unknown; at?: unknown; phased?: unknown }
-  if (!Array.isArray(runs) || typeof at !== 'number' || now - at > MAX_AGE_MS) return null
-  const ok = runs.filter((x): x is number => typeof x === 'number' && Number.isFinite(x) && x > 0).slice(-MAX_RUNS)
-  return ok.length > 0 ? { runs: ok, at, phased: phased === true } : null
+  const { ms, phased } = v as { ms?: unknown; phased?: unknown }
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? { ms, phased: phased === true } : null
 }
 
-/** 超過 200 個指令時要刪的鍵:最久沒寫入的那幾個。 */
-export function evictKeys(ats: readonly (readonly [string, number])[], max = MAX_COMMANDS): string[] {
-  if (ats.length <= max) return []
-  return [...ats].sort((a, b) => a[1] - b[1]).slice(0, ats.length - max).map(([k]) => k)
+/** 一個指令的幾次:最近 5 次長度的中位數;分段只要有一次就記著。 */
+export function summarize(runs: readonly (Run & { at: number })[]): { prior: number | null; phased: boolean } {
+  const recent = [...runs].sort((a, b) => b.at - a.at).slice(0, MAX_RUNS)
+  return { prior: median(recent.map(r => r.ms)), phased: runs.some(r => r.phased) }
+}
+
+/** 90 天前寫的歷史鍵:session 開始時刪掉(不只是查詢時忽略,verify R2 #10)。 */
+export function expiredKeys(keys: readonly string[], now: number): string[] {
+  return keys.filter(k => {
+    const r = parseRunKey(k)
+    return r !== null && now - r.at > MAX_AGE_MS
+  })
+}
+
+/** 要淘汰的鍵:每個指令只留最近 5 次;最近一次跑完最晚的 200 個指令以外,整個指令刪掉。 */
+export function evictRunKeys(keys: readonly string[], maxRuns = MAX_RUNS, maxCommands = MAX_COMMANDS): string[] {
+  const byHash = new Map<string, { k: string; at: number }[]>()
+  for (const k of keys) {
+    const r = parseRunKey(k)
+    if (r === null) continue
+    byHash.set(r.hash, [...(byHash.get(r.hash) ?? []), { k, at: r.at }])
+  }
+  const newestFirst = (a: { k: string; at: number }, b: { k: string; at: number }) => b.at - a.at || (a.k < b.k ? 1 : -1)
+  const groups = [...byHash.values()].map(g => [...g].sort(newestFirst))
+  const out = groups.flatMap(g => g.slice(maxRuns).map(x => x.k))
+  const ranked = [...groups].sort((a, b) => newestFirst(a[0]!, b[0]!))
+  return [...out, ...ranked.slice(maxCommands).flatMap(g => g.slice(0, maxRuns).map(x => x.k))]
 }
