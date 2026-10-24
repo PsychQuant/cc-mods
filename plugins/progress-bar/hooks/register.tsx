@@ -327,7 +327,7 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
   }
   if (!committed || gen !== pollGen) return
   for (const [f, m] of seen) mtimes.set(f, m)
-  await update($, now, () => t)
+  await update($, now, cur => (gen === pollGen ? Math.max(cur, t) : cur))
   await flushHistory($, t)
   if (gen !== pollGen) return
   // 有執行中的任務,顯示時鐘卻不在或太久沒跑(被取消的競態、某一期被拒):重開(verify R1 #2、#6)
@@ -349,7 +349,7 @@ async function frame($: EngineInterface, gen: number): Promise<void> {
   const running = list.filter(x => x.endedAt === null)
   if (running.length === 0) {
     live.clear()
-    if (Object.keys(prev).length > 0) await update($, shown, () => ({}))
+    if (Object.keys(prev).length > 0) await update($, shown, cur => (gen === displayGen ? {} : cur))
     if (gen !== displayGen) return
     stopDisplay()
     // 這一拍讀到的清單是同一刻的:停之前有人要了時鐘(剛加進任務),就重開(verify R1 #2)
