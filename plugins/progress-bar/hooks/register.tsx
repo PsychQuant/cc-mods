@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Pending, Shown, Tracked } from '../types'
 import {
-  asRun, CAP, etaFromReading, evictRunKeys, expiredKeys, fitAdd, fitEval, frameDt, hashCommand, HISTORY_PREFIX,
+  asRun, CAP, capPending, etaFromReading, evictRunKeys, expiredKeys, fitAdd, fitEval, frameDt, hashCommand, HISTORY_PREFIX,
   parseRunKey, rate, runKey, seedDisplay, step, summarize, target, targetByTime, targetRate,
 } from './est'
 import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from './parse'
@@ -17,7 +17,7 @@ const outputDir = atom({ plugin: 'progress-bar', key: 'outputDir' } as const, nu
 // 畫面上的顯示值:顯示時鐘算出來,畫出來的字串變了才寫
 const shown = atom({ plugin: 'progress-bar', key: 'shown' } as const, {} as Record<string, Shown>, { shape: 'shown-2' })
 // 跑完、還沒寫進歷史的長度:與顯示的任務清單分開,任務收起之後晚到的通知仍找得到(verify R2 #3)
-const pending = atom({ plugin: 'progress-bar', key: 'pending' } as const, [] as Pending[], { shape: 'pending-1' })
+const pending = atom({ plugin: 'progress-bar', key: 'pending' } as const, [] as Pending[], { shape: 'pending-2' })
 
 const POLL_MS = 2000
 const POLL_STALE_MS = 3 * POLL_MS      // 輪詢時鐘這麼久沒跑,顯示時鐘或下一個事件就重開它(verify R2 #5)
@@ -27,7 +27,6 @@ const SPIN_MS = 1000                   // 轉圈每秒一格:轉圈列 shown 每
 const KEEP_DONE_MS = 15_000            // 結束後再顯示多久
 const STALE_MS = 6 * 60 * 60 * 1000    // 沒收到結束通知的任務(與待寫的歷史),最多留多久
 const MAX_TASKS = 6
-const MAX_PENDING = 20
 const MAX_TRIES = 3                    // 一次跑完的長度寫不進 store,最多試幾次
 const MAX_READ = 4 * 1024 * 1024       // $.fs.read 的上限;更大的檔改用 tail
 const DROP = 5                         // 讀數下降超過幾個百分點算新階段
@@ -85,27 +84,36 @@ async function loadPrior($: EngineInterface, key: string, t: number): Promise<{ 
 
 const nonce = (): string => Math.floor(Math.random() * 36 ** 6).toString(36)
 
-/** 寫一次跑完的長度(新鍵,不覆寫);寫入失敗往外丟,讓呼叫端重試。淘汰失敗不影響這一次,下一次寫入時再淘汰。 */
-async function saveRun($: EngineInterface, p: Pending, t: number): Promise<void> {
-  await $.store.set(runKey(p.key, t, nonce()), { ms: p.ms, phased: p.phased })
-  try {
-    for (const k of evictRunKeys(await $.store.keys())) await $.store.delete(k).catch(() => undefined)
-  } catch {
-    // 淘汰不了:鍵多一點而已
-  }
+/**
+ * 刪掉不該留的歷史鍵:0.3.0 開發版的鍵、90 天前寫的(verify R2 #10)、超過每個指令 5 次 / 200 個指令的。
+ * session 開始時、每次寫入之後、寫入失敗時都跑一次 —— store 滿了寫不進去時,要先騰出空間(verify R3 #4)。
+ */
+async function pruneHistory($: EngineInterface, t: number): Promise<void> {
+  const keys = await $.store.keys()
+  const doomed = new Set([...keys.filter(isLegacyKey), ...expiredKeys(keys, t), ...evictRunKeys(keys)])
+  for (const k of doomed) await $.store.delete(k).catch(() => undefined)
 }
 
-/** session 開始時:刪掉 0.3.0 開發版的鍵,與 90 天前寫的歷史(不只是查詢時忽略,verify R2 #10)。 */
-async function cleanHistory($: EngineInterface, t: number): Promise<void> {
-  const keys = await $.store.keys().catch(() => [] as string[])
-  for (const k of [...keys.filter(isLegacyKey), ...expiredKeys(keys, t)]) await $.store.delete(k).catch(() => undefined)
+/**
+ * 寫一次跑完的長度到這一筆自己的鍵(`p.store`,建這一筆時就決定):重試與熱重載都寫同一個鍵,不會記成兩次(verify R3 #6)。
+ * 寫不進去時先清一次再試;還是不行就往外丟,讓呼叫端下一次 tick 再試。寫入之後的淘汰失敗不影響這一次。
+ */
+async function saveRun($: EngineInterface, p: Pending, t: number): Promise<void> {
+  const value = { ms: p.ms, phased: p.phased }
+  try {
+    await $.store.set(p.store, value)
+  } catch {
+    await pruneHistory($, t).catch(() => undefined)
+    await $.store.set(p.store, value)
+  }
+  await pruneHistory($, t).catch(() => undefined)
 }
 
 /** 跑完的長度能不能記:開始時間是真的、是 shell(有雜湊)、跑了至少 2 秒。 */
 const recordable = (x: Tracked, end: number): boolean => x.startKnown && x.key !== '' && end - x.startedAt >= MIN_RECORD_MS
 
 const pendingOf = (x: Tracked, end: number, status: string | null): Pending =>
-  ({ id: x.id, key: x.key, ms: end - x.startedAt, phased: x.phased, status, at: end, tries: 0 })
+  ({ id: x.id, key: x.key, ms: end - x.startedAt, phased: x.phased, status, at: end, tries: 0, store: runKey(x.key, end, nonce()) })
 
 const saved = new Set<string>()        // 這個模組寫過的任務 id:重複的通知、交錯的兩次寫入都不再寫一次
 const recording = new Set<string>()    // 正在寫的
@@ -131,14 +139,18 @@ async function flushHistory($: EngineInterface, t: number): Promise<void> {
     }
   }
   const gaveUp = list.filter(p => result.get(p.id) === false && p.tries + 1 >= MAX_TRIES).length
-  await update($, pending, latest => latest.flatMap(p => {
-    if (saved.has(p.id)) return []
-    if (p.status !== null && p.status !== 'completed') return []
-    if (p.status === null && t - p.at > STALE_MS) return []
-    if (result.get(p.id) === false) return p.tries + 1 >= MAX_TRIES ? [] : [{ ...p, tries: p.tries + 1 }]
-    return [p]
-  }))
-  for (const id of result.keys()) recording.delete(id)
+  try {
+    await update($, pending, latest => latest.flatMap(p => {
+      if (saved.has(p.id)) return []
+      if (p.status !== null && p.status !== 'completed') return []
+      if (p.status === null && t - p.at > STALE_MS) return []
+      if (result.get(p.id) === false) return p.tries + 1 >= MAX_TRIES ? [] : [{ ...p, tries: p.tries + 1 }]
+      return [p]
+    }))
+  } finally {
+    // 待寫清單寫不回去也要放掉:不然這幾筆以後永遠被當成「正在寫」,再也不重試(verify R3 #5)
+    for (const id of result.keys()) recording.delete(id)
+  }
   if (saved.size > 200) for (const id of [...saved].slice(0, saved.size - 200)) saved.delete(id)
   if (gaveUp > 0) {
     try {
@@ -270,6 +282,8 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
   }
   const patch = new Map<string, Pick<Tracked, 'percent' | 'line' | 'fit' | 'phased' | 'phase' | 'src'>>()
   const drop = new Set<string>()
+  // 這一拍讀到的 mtime 先記在這裡,讀數寫回去了才併進 mtimes:讀檔失敗、或這一拍已經被換掉時,下一拍還會再讀(verify R3 #2)
+  const seen = new Map<string, number>()
   for (const task of list) {
     const isOver = task.endedAt !== null && t - task.endedAt > KEEP_DONE_MS
     if (isOver || t - task.startedAt > STALE_MS) {
@@ -282,9 +296,9 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
     for (const f of task.files) {
       const st = await $.fs.stat(f).catch(() => undefined)
       if (st === undefined || st.kind !== 'file' || st.size === 0 || mtimes.get(f) === st.mtimeMs) continue
-      mtimes.set(f, st.mtimeMs)
       const text = await readTail($, f, st.size)
       if (text === undefined) continue
+      seen.set(f, st.mtimeMs)
       const r = readProgress(text)
       // 讀數只取一個檔(第一個讀到百分比的):兩個檔交替時不會被當成分段(verify R1 #37)。
       // 同一個百分比再讀到一次不算新讀數(pytest 一整行才印一次百分比,其間檔案照樣在變)
@@ -301,13 +315,21 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
     }
   }
   if (gen !== pollGen) return
+  let committed = true
   if (patch.size > 0 || drop.size > 0) {
-    // 用最新的清單套改動:這段時間 tool.call 可能剛加進一個任務
-    await update($, tasks, latest =>
-      latest.filter(x => !drop.has(x.id)).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x)))
+    committed = false
+    // 用最新的清單套改動:這段時間 tool.call 可能剛加進一個任務。套的那一刻再看一次 generation(verify R3 #3)
+    await update($, tasks, latest => {
+      if (gen !== pollGen) return latest
+      committed = true
+      return latest.filter(x => !drop.has(x.id)).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x))
+    })
   }
+  if (!committed || gen !== pollGen) return
+  for (const [f, m] of seen) mtimes.set(f, m)
   await update($, now, () => t)
   await flushHistory($, t)
+  if (gen !== pollGen) return
   // 有執行中的任務,顯示時鐘卻不在或太久沒跑(被取消的競態、某一期被拒):重開(verify R1 #2、#6)
   if (list.some(x => x.endedAt === null && !drop.has(x.id)) && (display === null || t - lastFrame > STALE_FRAME_MS)) {
     stopDisplay()
@@ -352,7 +374,7 @@ async function frame($: EngineInterface, gen: number): Promise<void> {
     next[x.id] = { d, frame: est === null ? fr : 0, eta: est?.eta ?? null, spin: est === null, note: est?.note ?? null }
   }
   for (const id of live.keys()) if (!(id in next)) live.delete(id)
-  if (keyOf(prev) !== keyOf(next)) await update($, shown, () => next)
+  if (keyOf(prev) !== keyOf(next)) await update($, shown, cur => (gen === displayGen ? next : cur))
 }
 
 /** 執行中的那一列畫轉圈還是長條;顯示時鐘還沒算過的任務,照 estimateNow 會走的那一支(verify R1 #28)。 */
@@ -386,7 +408,7 @@ export const register: Register = on => {
     stopDisplay()
     startPoll($, t)
     startDisplay($, t)                          // 沒有執行中的任務,第一拍就自己停
-    void cleanHistory($, t).catch(() => undefined)
+    void pruneHistory($, t).catch(() => undefined)
     return next(e)
   })
 
@@ -442,57 +464,62 @@ export const register: Register = on => {
   // (2) 記著、但已經不在清單裡的,推定結束;能記歷史的先放進待寫的清單,等結束通知說它是不是 completed
   on('classic.Stop', async ($, e, next) => {
     const r = await next(e)
-    if (e.background_tasks === undefined) return r       // 引擎沒給清單:不猜
-    const running = e.background_tasks.filter(b => b.status === 'running' || b.status === 'pending')
-    const alive = new Set(running.map(b => b.id))
-    const list = await read($, tasks)
-    const known = new Set(list.map(x => x.id))
-    const dir = await read($, outputDir)
-    const t = await $.clock.now()
-    const picked: Tracked[] = []
-    for (const b of running) {
-      if (known.has(b.id)) continue
-      const isShell = b.type === 'shell'
-      const command = isShell ? (b.command ?? '') : ''
-      const key = command === '' ? '' : hashCommand(command)
-      const hist = await loadPrior($, key, t)
-      picked.push({
-        id: b.id,
-        label: (b.description || b.name || b.agent_type || b.command || b.id).replace(/\s+/g, ' ').slice(0, 48),
-        key,
-        files: isShell ? await filesOf($, command, dir === null ? undefined : `${dir}/${b.id}.output`) : [],
-        src: null,
-        startedAt: t,
-        startKnown: false,
-        prior: hist.prior,
-        priorPhased: hist.phased,
-        percent: null,
-        fit: null,
-        phased: false,
-        phase: 1,
-        line: '',
-        endedAt: null,
-        status: null,
-        presumed: false,
-        final: null,
-      })
+    // next(e) 已經跑過了:之後的錯誤在這裡接住(丟出去的話引擎把這個 hook 記成被跳過;結果照樣是 next(e) 的那一個)
+    try {
+      ensurePoll($, await $.clock.now())
+      if (e.background_tasks === undefined) return r       // 引擎沒給清單:不猜
+      const running = e.background_tasks.filter(b => b.status === 'running' || b.status === 'pending')
+      const alive = new Set(running.map(b => b.id))
+      const list = await read($, tasks)
+      const known = new Set(list.map(x => x.id))
+      const dir = await read($, outputDir)
+      const t = await $.clock.now()
+      const picked: Tracked[] = []
+      for (const b of running) {
+        if (known.has(b.id)) continue
+        const isShell = b.type === 'shell'
+        const command = isShell ? (b.command ?? '') : ''
+        const key = command === '' ? '' : hashCommand(command)
+        const hist = await loadPrior($, key, t)
+        picked.push({
+          id: b.id,
+          label: (b.description || b.name || b.agent_type || b.command || b.id).replace(/\s+/g, ' ').slice(0, 48),
+          key,
+          files: isShell ? await filesOf($, command, dir === null ? undefined : `${dir}/${b.id}.output`) : [],
+          src: null,
+          startedAt: t,
+          startKnown: false,
+          prior: hist.prior,
+          priorPhased: hist.phased,
+          percent: null,
+          fit: null,
+          phased: false,
+          phase: 1,
+          line: '',
+          endedAt: null,
+          status: null,
+          presumed: false,
+          final: null,
+        })
+      }
+      const gone = list.filter(x => x.endedAt === null && !alive.has(x.id))
+      const goneIds = new Set(gone.map(x => x.id))
+      if (picked.length > 0 || gone.length > 0) {
+        await update($, tasks, latest => [
+          ...latest.map(x => (goneIds.has(x.id) && x.endedAt === null
+            ? { ...x, endedAt: t, status: x.status ?? 'ended', presumed: true, final: shownD(x.id) }
+            : x)),
+          ...picked.filter(p => !latest.some(x => x.id === p.id)),
+        ].slice(-MAX_TASKS))
+      }
+      const add = gone.filter(x => recordable(x, t)).map(x => pendingOf(x, t, null))
+      if (add.length > 0) {
+        await update($, pending, latest => capPending([...latest, ...add.filter(a => !latest.some(p => p.id === a.id))]))
+      }
+      if (picked.length > 0) startDisplay($, t)
+    } catch {
+      // 只是顯示,記不起來就算了
     }
-    const gone = list.filter(x => x.endedAt === null && !alive.has(x.id))
-    const goneIds = new Set(gone.map(x => x.id))
-    if (picked.length > 0 || gone.length > 0) {
-      await update($, tasks, latest => [
-        ...latest.map(x => (goneIds.has(x.id) && x.endedAt === null
-          ? { ...x, endedAt: t, status: x.status ?? 'ended', presumed: true, final: shownD(x.id) }
-          : x)),
-        ...picked.filter(p => !latest.some(x => x.id === p.id)),
-      ].slice(-MAX_TASKS))
-    }
-    const add = gone.filter(x => recordable(x, t)).map(x => pendingOf(x, t, null))
-    if (add.length > 0) {
-      await update($, pending, latest => [...latest, ...add.filter(a => !latest.some(p => p.id === a.id))].slice(-MAX_PENDING))
-    }
-    ensurePoll($, t)
-    if (picked.length > 0) startDisplay($, t)
     return r
   }).catch(($, e, next) => next(e))   // 壞了也不影響這一輪的結束
 
@@ -500,27 +527,34 @@ export const register: Register = on => {
   // 長度取「開始」到「最早得知結束」(推定結束或這個通知):沒有引擎的完成時間,是估計
   on('session.append', async ($, e, next) => {
     const r = await next(e)
-    if (e.message.type !== 'user') return r
-    const text = JSON.stringify(e.message)
-    if (!text.includes('<task-id>')) return r
-    const ends = new Map<string, string>()
-    for (const m of text.matchAll(NOTICE)) {
-      if (m[1] !== undefined && m[2] !== undefined) ends.set(m[1], m[2])
+    // next(e) 已經跑過了:之後的錯誤在這裡接住(丟出去的話引擎把這個 hook 記成被跳過;這一列照樣只存一次)
+    try {
+      if (e.message.type !== 'user') return r
+      const text = JSON.stringify(e.message)
+      if (!text.includes('<task-id>')) return r
+      const ends = new Map<string, string>()
+      for (const m of text.matchAll(NOTICE)) {
+        if (m[1] !== undefined && m[2] !== undefined) ends.set(m[1], m[2])
+      }
+      if (ends.size === 0) return r
+      const t = await $.clock.now()
+      const list = await read($, tasks)
+      const open = (x: Tracked) => ends.has(x.id) && (x.endedAt === null || x.presumed)
+      // 推定結束了的也建:每一輪結束時先寫任務、再寫待寫清單,通知可能剛好插在中間(verify R3 #1)。長度用推定結束的那一刻
+      const fresh = list.filter(x => open(x) && recordable(x, x.endedAt ?? t))
+        .map(x => pendingOf(x, x.endedAt ?? t, ends.get(x.id) ?? null))
+      await update($, tasks, l => l.map(x => (open(x)
+        ? { ...x, endedAt: x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
+        : x)))
+      await update($, pending, latest => capPending([
+        ...latest.map(p => (ends.has(p.id) && p.status === null ? { ...p, status: ends.get(p.id) ?? null } : p)),
+        ...fresh.filter(f => !latest.some(p => p.id === f.id)),
+      ]))
+      ensurePoll($, t)
+      await flushHistory($, t)
+    } catch {
+      // 只是顯示,記不起來就算了
     }
-    if (ends.size === 0) return r
-    const t = await $.clock.now()
-    const list = await read($, tasks)
-    const open = (x: Tracked) => ends.has(x.id) && (x.endedAt === null || x.presumed)
-    const fresh = list.filter(x => ends.has(x.id) && x.endedAt === null && recordable(x, t))
-      .map(x => pendingOf(x, t, ends.get(x.id) ?? null))
-    await update($, tasks, l => l.map(x => (open(x)
-      ? { ...x, endedAt: x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
-      : x)))
-    await update($, pending, latest => [
-      ...latest.map(p => (ends.has(p.id) && p.status === null ? { ...p, status: ends.get(p.id) ?? null } : p)),
-      ...fresh.filter(f => !latest.some(p => p.id === f.id)),
-    ].slice(-MAX_PENDING))
-    await flushHistory($, t)
     return r
   }).catch(($, e, next) => next(e))   // 壞了也照原樣存這一列
 

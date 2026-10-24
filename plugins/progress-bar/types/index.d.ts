@@ -83,6 +83,8 @@ export type Pending = {
   at: number
   /** 寫入 store 失敗過幾次 */
   tries: number
+  /** 這一次要寫的 store 鍵,建這一筆時就決定:重試與熱重載都寫同一個鍵,不會記成兩次(verify R3 #6) */
+  store: string
 }
 
 /** 畫面上的顯示值(每 250 ms 由顯示時鐘算出;畫出來的字串變了才寫)。 */

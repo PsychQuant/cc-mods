@@ -10,7 +10,7 @@
  *     最低速度是剩下距離的 1/3600 每秒 —— 只增不減、不停,但讀數停住時不會一路衝上去。
  */
 
-import type { Fit } from '../types'
+import type { Fit, Pending } from '../types'
 
 // ── 參數:手感要調只改這裡 ──
 export const CAP = 99.5            // 任務結束前的上限(%)
@@ -29,6 +29,7 @@ export const MAX_LEAD = 10         // 領先最後讀數最多幾個百分點
 const EW = 0.3                     // 讀數間隔、步幅的 EW 平均係數
 const MAX_RUNS = 5                 // 每個指令留幾次的長度
 const MAX_COMMANDS = 200           // 最多記幾個指令
+const MAX_PENDING = 20             // 跑完、還沒寫進歷史的最多留幾筆
 const MAX_AGE_MS = 90 * 86_400_000 // 90 天前的歷史刪掉
 const MAX_DT_S = 0.5               // 每拍的 dt 上限(秒):兩拍隔很久時只會落後,不會超前(verify R1 #7)
 
@@ -241,4 +242,12 @@ export function evictRunKeys(keys: readonly string[], maxRuns = MAX_RUNS, maxCom
   const out = groups.flatMap(g => g.slice(maxRuns).map(x => x.k))
   const ranked = [...groups].sort((a, b) => newestFirst(a[0]!, b[0]!))
   return [...out, ...ranked.slice(maxCommands).flatMap(g => g.slice(0, maxRuns).map(x => x.k))]
+}
+
+/** 待寫的最多 `max` 筆;超過時先丟沒等到通知的、再丟最舊的 —— 已確認跑完、還沒寫進去的盡量留著(verify R3 #7)。不改動 `list`。 */
+export function capPending(list: readonly Pending[], max = MAX_PENDING): Pending[] {
+  if (list.length <= max) return [...list]
+  const order = [...list].sort((a, b) => Number(a.status !== null) - Number(b.status !== null) || a.at - b.at)
+  const out = new Set(order.slice(0, list.length - max).map(p => p.id))
+  return list.filter(p => !out.has(p.id))
 }

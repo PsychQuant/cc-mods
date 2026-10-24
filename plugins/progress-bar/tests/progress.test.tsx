@@ -606,7 +606,7 @@ test('寫不進 store 的那一次,下一次 tick 再寫(verify R2 #11)', async 
   const clock = mock.clock(on, { now: 13_000_000 })
   engineDraws(on)
   const mem: Record<string, unknown> = {}
-  let fail = 1
+  let fail = 2                               // 同一次寫入裡的兩次(第二次是清過 store 之後再試)都失敗
   on('store.get', (_, e) => ({ value: mem[e.key] }))
   on('store.set', (_, e) => {
     if (fail > 0) {
@@ -724,4 +724,141 @@ test('接上的 shell 就算有歷史也畫轉圈(沒有真的開始時間,不�
   expect(SPINNER.test(await rowText($, /Attached make/))).toBe(true)   // 顯示時鐘還沒算過
   await clock.advance(3000)
   expect(SPINNER.test(await rowText($, /Attached make/))).toBe(true)
+})
+
+
+test('結束通知剛好插在推定結束的兩次寫入之間:照樣寫進歷史(verify R3 #1)', async ($, on) => {
+  const clock = mock.clock(on, { now: 18_000_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'x1')
+  let armed = false
+  on('state.set', async (_, e, next) => {
+    const r = await next(e)
+    const v = (e.value as { value?: { id: string; presumed: boolean }[] } | undefined)?.value
+    if (armed && e.plugin === 'progress-bar' && e.key === 'tasks' && Array.isArray(v) && v.some(x => x.id === 'x1' && x.presumed)) {
+      armed = false                          // 推定結束的任務剛寫進去、待寫清單還沒寫:通知在這裡到
+      await $.session.append(ended('x1'))
+    }
+    return r
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make race', description: 'Race', run_in_background: true })
+  await clock.advance(5000)
+  armed = true
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  await clock.advance(2000)
+  expect(runsOf(mem, 'make race').map(r => r.ms)).toEqual([5000])
+})
+
+test('讀檔失敗時不記下 mtime:檔沒再變,下一拍也會再讀(verify R3 #2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 19_000_000 })
+  engineDraws(on)
+  mock.env(on, { HOME: '/Users/me', CLAUDE_JOB_DIR: '/jobs/1' })
+  const log = 'tests/a.py ....  [ 42%]\n'
+  let failRead = 1
+  on('fs.stat', (_, e) => (e.path === LOG ? fileStat(log.length, 1) : noFile))
+  on('fs.read', (_, e) => {
+    if (e.path === LOG && failRead > 0) {
+      failRead -= 1
+      return { deny: 'busy' }
+    }
+    return { value: e.path === LOG ? log : '' }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'r9')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'pytest -q > $CLAUDE_JOB_DIR/tmp/pytest.log 2>&1', description: 'Read retry', run_in_background: true })
+  await clock.advance(2000)                  // 第一次讀失敗
+  await clock.advance(2500)                  // 第二次讀到(mtime 沒變)
+  expect(shownPct(await rowText($, /Read retry/)) >= 42).toBe(true)
+})
+
+test('store 滿了:先清掉超額的歷史再寫(verify R3 #4)', async ($, on) => {
+  const clock = mock.clock(on, { now: 20_000_000 })
+  engineDraws(on)
+  const mem: Record<string, unknown> = {}
+  const LIMIT = 6
+  on('store.get', (_, e) => ({ value: mem[e.key] }))
+  on('store.set', (_, e) => {
+    if (!(e.key in mem) && Object.keys(mem).length >= LIMIT) return { deny: 'store full' }
+    mem[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    delete mem[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(mem) }))
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'f1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  const h = hashCommand('make full')
+  for (let i = 0; i < 6; i++) mem[`h3:${h}:${19_000_000 + i}:${i}`] = { ms: 1000 + i, phased: false }   // 已經滿了,而且超過 5 次
+  await $.tool.call({ tool: 'Bash', command: 'make full', description: 'Full store', run_in_background: true })
+  await clock.advance(7000)
+  await $.session.append(ended('f1'))
+  const runs = runsOf(mem, 'make full')
+  expect(runs.length).toBe(5)
+  expect(runs.some(r => r.ms === 7000)).toBe(true)
+})
+
+test('寫入失敗、待寫清單也寫不回去:下一拍照樣重試(verify R3 #5)', async ($, on) => {
+  const clock = mock.clock(on, { now: 21_000_000 })
+  engineDraws(on)
+  const mem: Record<string, unknown> = {}
+  let failSet = 2
+  on('store.get', (_, e) => ({ value: mem[e.key] }))
+  on('store.set', (_, e) => {
+    if (failSet > 0) {
+      failSet -= 1
+      return { deny: 'disk full' }
+    }
+    mem[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    delete mem[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(mem) }))
+  let pendingWrites = 0
+  on('state.set', (_, e, next) => {
+    if (e.plugin === 'progress-bar' && e.key === 'pending') {
+      pendingWrites += 1
+      if (pendingWrites === 2) return { deny: 'state busy' }   // 第 1 次是放進待寫清單,第 2 次是寫入失敗後的更新
+    }
+    return next(e)
+  })
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'u1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make again', description: 'Again', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('u1'))
+  expect(runsOf(mem, 'make again')).toEqual([])
+  await clock.advance(2000)
+  expect(runsOf(mem, 'make again').map(r => r.ms)).toEqual([3000])
+})
+
+test('待寫清單一直寫不進去:結束通知那一列照樣只存一次,任務照樣標成結束', async ($, on) => {
+  const clock = mock.clock(on, { now: 22_000_000 })
+  engineDraws(on)
+  const session = mock.session(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('state.set', (_, e, next) => (e.plugin === 'progress-bar' && e.key === 'pending' ? { deny: 'always' } : next(e)))
+  background(on, () => 'd1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make dup', description: 'Dup', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('d1'))
+  expect(session.appended().length).toBe(1)
+  expect(await rowText($, /Dup/)).toContain('completed')
 })

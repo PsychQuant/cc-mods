@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  asRun, CAP, etaFromReading, expiredKeys, evictRunKeys, fitAdd, fitEval, frameDt, hashCommand, MAX_LEAD, median, parseRunKey,
+  asRun, CAP, capPending, etaFromReading, expiredKeys, evictRunKeys, fitAdd, fitEval, frameDt, hashCommand, MAX_LEAD, median, parseRunKey,
   rate, runKey, seedDisplay, step, summarize, target, targetRate,
 } from '../hooks/est'
 import type { Fit } from '../hooks/est'
@@ -229,5 +229,18 @@ describe('歷史(每次跑完一個 store 鍵,不覆寫)', () => {
     const many = Array.from({ length: 203 }, (_, i) => runKey(hashCommand(`c${i}`), i + 1, 'x'))
     expect(evictRunKeys(many).sort()).toEqual(many.slice(0, 3).sort())
     expect(evictRunKeys(many.slice(0, 200))).toEqual([])
+  })
+})
+
+
+describe('待寫的歷史', () => {
+  test('超過上限時先丟沒等到通知的、再丟最舊的(verify R3 #7)', () => {
+    const p = (id: string, status: string | null, at: number) =>
+      ({ id, key: 'k', ms: 1000, phased: false, status, at, tries: 0, store: `h3:k:${at}:${id}` })
+    const list = [p('a', 'completed', 1), p('b', null, 2), p('c', 'completed', 3), p('d', null, 4)]
+    expect(capPending(list, 2).map(x => x.id)).toEqual(['a', 'c'])
+    expect(capPending(list, 1).map(x => x.id)).toEqual(['c'])
+    expect(capPending(list, 4)).toEqual(list)
+    expect(capPending(list, 4)).not.toBe(list)
   })
 })
