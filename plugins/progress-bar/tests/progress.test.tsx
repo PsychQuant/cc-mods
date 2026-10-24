@@ -2,6 +2,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
+import { hashCommand, MAX_LEAD } from '../hooks/est'
 import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from '../hooks/parse'
 
 describe('readProgress', () => {
@@ -123,7 +124,7 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
     const ui = await $.ui.mount({ ...BAND, surface })
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
     // 追上了讀數,最多再領先一個典型步幅(上限 10 個百分點)
-    expect(shownPct(text) >= 42 && shownPct(text) <= 52).toBe(true)
+    expect(shownPct(text) >= 42 && shownPct(text) <= 42 + MAX_LEAD + 0.5).toBe(true)
     expect(text).toContain('█')
     // 疊在下面的東西照樣畫(同一條 band 上的其他 mod 不被蓋掉)
     expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
@@ -147,6 +148,7 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
     expect(text).toContain('✓')
     expect(text).toContain('completed')
+    expect(text).toContain('100%')          // 結束那一刻不往回掉(verify R1 #16)
     await ui.unmount()
   }
 
@@ -272,6 +274,11 @@ function memoryStore(on: On): Record<string, unknown> {
     mem[e.key] = JSON.parse(JSON.stringify(e.value))
     return { value: undefined }
   })
+  on('store.delete', (_, e) => {
+    delete mem[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(mem) }))
   return mem
 }
 
@@ -331,8 +338,9 @@ test('跑完的時間記進 store;同一個指令字串下次沒有讀數也有�
   expect(SPINNER.test(await rowText($, /Build it/))).toBe(true)
   await clock.advance(29_000)
   await $.session.append(ended('h1'))
-  const stored = mem['history-1'] as Record<string, { runs: number[] }> | undefined
-  expect(stored?.['make build']?.runs).toEqual([30_000])
+  const stored = mem[`h2:${hashCommand('make build')}`] as { runs: number[] } | undefined
+  expect(stored?.runs).toEqual([30_000])
+  expect(JSON.stringify(mem).includes('make build')).toBe(false)   // store 裡不存指令原字串(verify R1 #11)
 
   // 第二次:同一個指令字串,依經過時間畫長條
   await clock.advance(20_000)               // 第一列收起
@@ -355,12 +363,18 @@ test('沒有百分比也沒有歷史:轉圈隨時鐘前進;任務結束後清空
     if (e.plugin === 'progress-bar' && e.key === 'shown') writes.push(e.value)
     return next(e)
   })
+  let reads = 0
+  let counting = false
+  on('state.get', (_, e, next) => {
+    if (counting && e.plugin === 'progress-bar' && e.key === 'tasks') reads += 1
+    return next(e)
+  })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.tool.call({ tool: 'Bash', command: 'sleep 60', description: 'Just wait', run_in_background: true })
 
   await clock.advance(250)
   const a = (await rowText($, /Just wait/)).slice(0, 1)
-  await clock.advance(250)
+  await clock.advance(1000)                   // 轉圈每秒一格
   const b = (await rowText($, /Just wait/)).slice(0, 1)
   expect(SPINNER.test(`${a} `) && SPINNER.test(`${b} `)).toBe(true)
   expect(a === b).toBe(false)
@@ -370,6 +384,126 @@ test('沒有百分比也沒有歷史:轉圈隨時鐘前進;任務結束後清空
   // shape 版本的 atom 存成 { shape, value }
   expect((writes.at(-1) as { value?: unknown } | undefined)?.value).toEqual({})
   const count = writes.length
+  reads = 0
+  counting = true
   await clock.advance(3000)
   expect(writes.length).toBe(count)
+  // 顯示時鐘真的停了:3 秒內讀 tasks 的只有 2 秒一次的 tick(時鐘還在的話每 250 ms 一次,verify R1 #26)
+  expect(reads <= 3).toBe(true)
+})
+
+
+test('轉圈列每秒最多寫一次 shown(其他 mod 不會跟著每 250 ms 重畫)', async ($, on) => {
+  const clock = mock.clock(on, { now: 6_000_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's2')
+  let writes = 0
+  on('state.set', ($, e, next) => {
+    if (e.plugin === 'progress-bar' && e.key === 'shown') writes += 1
+    return next(e)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99', description: 'Spin only', run_in_background: true })
+  writes = 0
+  await clock.advance(3000)
+  expect(writes <= 4).toBe(true)
+})
+
+test('停顯示時鐘的那一拍剛好加進新任務:時鐘照樣重開(verify R1 #2、#6)', async ($, on) => {
+  const clock = mock.clock(on, { now: 7_000_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let id = 'r1'
+  background(on, () => id)
+  const seen = new Set<string>()
+  let armed = false
+  on('state.get', async (_, e, next) => {
+    if (armed && e.plugin === 'progress-bar' && e.key === 'shown') {
+      armed = false                          // 這一拍讀到的清單已經是空的:在它停時鐘之前加進新任務
+      id = 'r2'
+      await $.tool.call({ tool: 'Bash', command: 'sleep 98', description: 'Late task', run_in_background: true })
+    }
+    return next(e)
+  })
+  on('state.set', ($, e, next) => {
+    if (e.plugin === 'progress-bar' && e.key === 'shown') {
+      const v = (e.value as { value?: Record<string, unknown> } | undefined)?.value ?? {}
+      for (const k of Object.keys(v)) seen.add(k)
+    }
+    return next(e)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 97', description: 'First task', run_in_background: true })
+  await clock.advance(500)
+  await $.session.append(ended('r1'))
+  armed = true
+  await clock.advance(250)                   // 這一拍沒有執行中的任務 → 停時鐘;停之前 r2 加進來了
+  await clock.advance(750)                   // 不到 tick 的 2 秒:只能靠 frame 自己重開
+  expect(seen.has('r2')).toBe(true)
+})
+
+test('多階段:讀數往回掉後列尾寫這一段的讀數、不顯示還要多久;跑完記下分段,下次一開始就依經過時間', async ($, on) => {
+  const clock = mock.clock(on, { now: 8_000_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  mock.env(on, { HOME: '/Users/me', CLAUDE_JOB_DIR: '/jobs/1' })
+  let log = ''
+  let mtime = 0
+  on('fs.stat', (_, e) => (e.path === LOG ? fileStat(Math.max(1, log.length), mtime) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === LOG ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let id = 'm1'
+  background(on, () => id)
+  const cmd = 'git clone x > $CLAUDE_JOB_DIR/tmp/pytest.log 2>&1'
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: cmd, description: 'Clone repo', run_in_background: true })
+  log = 'Counting objects: 100%\n'
+  mtime = 1
+  await clock.advance(2000)
+  log += 'Receiving objects:  10%\r'
+  mtime = 2
+  await clock.advance(2000)
+  await clock.advance(500)
+  const text = await rowText($, /Clone repo/)
+  expect(text).toContain('第 2 段 10%')
+  expect(text.includes('還要')).toBe(false)
+  await clock.advance(20_000)
+  await $.session.append(ended('m1'))
+  const entry = mem[`h2:${hashCommand(cmd)}`] as { phased?: boolean } | undefined
+  expect(entry?.phased).toBe(true)
+
+  // 第二次:同一個指令字串,歷史記著會分段 → 依經過時間畫,不被第一段推到頂
+  await clock.advance(20_000)
+  id = 'm2'
+  log = ''
+  mtime = 3
+  await $.tool.call({ tool: 'Bash', command: cmd, description: 'Clone again', run_in_background: true })
+  log = 'Counting objects: 100%\n'
+  mtime = 4
+  await clock.advance(4000)
+  const again = await rowText($, /Clone again/)
+  expect(shownPct(again) < 50).toBe(true)
+  expect(again).toContain('還要')
+})
+
+test('每一輪結束時先被推定結束、之後才到的 completed 通知:照樣寫進歷史(verify R1 #3、#10)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_500_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'p1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make docs', description: 'Docs', run_in_background: true })
+  await clock.advance(10_000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 清單裡沒有了:推定結束
+  await clock.advance(3000)
+  await $.session.append(ended('p1'))
+  const entry = mem[`h2:${hashCommand('make docs')}`] as { runs: number[] } | undefined
+  expect(entry?.runs).toEqual([10_000])      // 長度取推定結束那一刻,不是通知到達的那一刻
+  expect((await rowText($, /Docs/))).toContain('completed')
 })

@@ -30,40 +30,54 @@ export type Tracked = {
   id: string
   /** 顯示的名字:Bash 的 description,沒有就用指令開頭 */
   label: string
-  /** 指令字串原樣(歷史的鍵);不是 shell 的背景工作是空字串 */
-  command: string
+  /** 指令字串的雜湊(歷史的鍵,store 裡不存原字串);不是 shell 的背景工作是空字串 */
+  key: string
   /** 要讀的檔:任務的輸出檔,加上指令裡 `>`、`>>`、`tee` 寫到的絕對路徑 */
   files: string[]
+  /** 讀數取自哪一個檔(第一個讀到百分比的檔);兩個檔各有百分比時只看這一個 */
+  src: string | null
   /** 開始的時間(epoch ms);接上的任務是接上的那一刻 */
   startedAt: number
   /** 開始時間是真的(Bash 開跑時記下的);接上的任務是 false,不寫歷史 */
   startKnown: boolean
   /** 同一個指令字串過去跑完的長度的中位數(ms);沒有歷史是 null */
   prior: number | null
+  /** 歷史記著這個指令會分段(讀數到頂後又從頭開始) */
+  priorPhased: boolean
   /** 讀到的最後一個百分比(0–100);讀不到是 null */
   percent: number | null
   /** 速率估計的狀態;還沒有讀數是 null */
   fit: Fit | null
-  /** 讀數往回掉過(多階段的指令) */
+  /** 這一次讀數往回掉過(多階段的指令) */
   phased: boolean
+  /** 第幾段(從 1 起) */
+  phase: number
   /** 輸出的最後一行(截短) */
   line: string
   /** 任務結束的時間;還在跑是 null */
   endedAt: number | null
-  /** 結束時的狀態(completed、failed、killed);還在跑是 null */
+  /** 結束時的狀態(completed、failed、killed;每一輪結束時清單裡沒有了是 ended);還在跑是 null */
   status: string | null
+  /** 只是從背景清單推定結束,還沒收到結束通知 */
+  presumed: boolean
+  /** 已經寫進歷史 */
+  recorded: boolean
+  /** 結束那一刻畫面上的顯示值;沒有是 null */
+  final: number | null
 }
 
 /** 畫面上的顯示值(每 250 ms 由顯示時鐘算出;畫出來的字串變了才寫)。 */
 export type Shown = {
   /** 顯示的百分比 */
   d: number
-  /** 轉圈的第幾格 */
+  /** 轉圈的第幾格(每秒一格) */
   frame: number
   /** 還要幾秒;不顯示是 null */
   eta: number | null
   /** 沒有估計:畫轉圈 */
   spin: boolean
+  /** 列尾的說明(分段時是這一段的真實讀數);沒有是 null */
+  note: string | null
 }
 
 declare module 'claude-code' {

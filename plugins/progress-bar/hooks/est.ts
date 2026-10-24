@@ -25,10 +25,12 @@ const CREEP_S = 3600               // 最低速度 = (CAP − d) / 3600 每秒
 const CATCH_S = 0.75               // 落後時追趕的時間常數(秒)
 const SNAP = 0.05                  // 差不到這麼多就直接貼上目標(百分點)
 const TAU_MIN = 5                  // 外插飽和的時間常數下限(秒)
-const MAX_LEAD = 10                // 領先最後讀數最多幾個百分點
+export const MAX_LEAD = 10         // 領先最後讀數最多幾個百分點
 const EW = 0.3                     // 讀數間隔、步幅的 EW 平均係數
 const MAX_RUNS = 5                 // 每個指令留幾次的長度
 const MAX_COMMANDS = 200           // 最多記幾個指令
+const MAX_AGE_MS = 90 * 86_400_000 // 90 天沒寫入的歷史當作沒有
+const MAX_DT_S = 0.5               // 每拍的 dt 上限(秒):兩拍隔很久時只會落後,不會超前(verify R1 #7)
 
 // 指數權重 local linear 的狀態放在 state 裡,型別由 contract 定義;原點放在最後一個讀數(`tLast`),所以 `s1` ≤ 0。
 export type { Fit }
@@ -47,7 +49,8 @@ export function fitAdd(fit: Fit | null, t: number, p: number): Fit {
   if (fit === null) {
     return { s0: 1, s1: 0, s2: 0, sy: p, sty: 0, sww: 1, tLast: t, pLast: p, gap: null, step: null, carry: null }
   }
-  const dt = Math.max(0, t - fit.tLast)
+  const tt = Math.max(t, fit.tLast)       // 時間倒退:原點不動(verify R1 #20)
+  const dt = tt - fit.tLast
   const lam = Math.exp(-dt / bandwidth(fit.gap))
   // 衰減,再把原點往後移 dt:t' = t − dt
   const s0 = lam * fit.s0
@@ -63,7 +66,7 @@ export function fitAdd(fit: Fit | null, t: number, p: number): Fit {
     sy: sy + p,
     sty: sty - dt * sy,
     sww: lam * lam * fit.sww + 1,
-    tLast: t,
+    tLast: tt,
     pLast: p,
     gap: dt > 0 ? ewAvg(fit.gap, dt) : fit.gap,
     step: dp > 0 ? ewAvg(fit.step, dp) : fit.step,
@@ -138,14 +141,35 @@ export function step(d: number, tgt: number, vt: number, dt: number): number {
   return Math.max(d, Math.min(CAP, next))
 }
 
-/** 還要幾秒:從顯示值(或最後讀數,取大的)到 100%。 */
-export function eta(shown: number, pLast: number, b: number): number {
-  return (100 - Math.max(shown, pLast)) / b
+/** 這一拍的 dt(秒):`fromMs` 到 `toMs`,上限 `MAX_DT_S`、下限 0。 */
+export function frameDt(fromMs: number, toMs: number): number {
+  return Math.min(MAX_DT_S, Math.max(0, (toMs - fromMs) / 1000))
 }
 
-// ── 歷史:完全相同的指令字串 → 最近幾次跑完的長度(ms) ──
+/** 讀數那一支的還要幾秒:從最後讀數到 100%;讀數已到 100% 或速率不是正的就不顯示(verify R1 #9)。 */
+export function etaFromReading(pLast: number, b: number): number | null {
+  const v = (100 - pLast) / b
+  return b > 0 && v > 0 ? v : null
+}
 
-export type History = Readonly<Record<string, { runs: readonly number[]; at: number }>>
+// ── 歷史:完全相同的指令字串 → 最近幾次跑完的長度(ms)。store 裡只存字串的雜湊,不存原字串(verify R1 #11);
+//    每個指令一個 store 鍵,不同指令並發完成時不會互相覆蓋(R1 #4)
+
+export type Entry = { runs: number[]; at: number; phased: boolean }
+export const HISTORY_PREFIX = 'h2:'
+
+const FNV_OFFSET = 0xcbf29ce484222325n
+const FNV_PRIME = 0x100000001b3n
+const MASK64 = (1n << 64n) - 1n
+
+/** 64 位元 FNV-1a(逐個 UTF-16 code unit):同一字串同一雜湊;16 位十六進位。 */
+export function hashCommand(command: string): string {
+  let h = FNV_OFFSET
+  for (let i = 0; i < command.length; i++) {
+    h = ((h ^ BigInt(command.charCodeAt(i))) * FNV_PRIME) & MASK64
+  }
+  return h.toString(16).padStart(16, '0')
+}
 
 export function median(xs: readonly number[]): number | null {
   if (xs.length === 0) return null
@@ -154,31 +178,26 @@ export function median(xs: readonly number[]): number | null {
   return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2
 }
 
-/** 這個指令過去跑完的長度的中位數(ms);沒有就是 null。 */
-export function lookup(h: History, command: string): number | null {
-  return Object.hasOwn(h, command) ? median(h[command]!.runs) : null
+/** 加一次跑完的長度:留最近 5 次;分段只要有一次就記著。不改動 `prev`。 */
+export function addRun(prev: Entry | null, ms: number, now: number, phased: boolean): Entry {
+  return { runs: [...(prev?.runs ?? []), ms].slice(-MAX_RUNS), at: now, phased: phased || (prev?.phased ?? false) }
 }
 
-/** 記一次跑完的長度。回傳新的物件:每個指令留最近 5 次,超過 200 個指令時丟掉最久沒寫入的。 */
-export function record(h: History, command: string, ms: number, now: number): History {
-  const prev = Object.hasOwn(h, command) ? h[command]!.runs : []
-  const next: Record<string, { runs: readonly number[]; at: number }> = { ...h, [command]: { runs: [...prev, ms].slice(-MAX_RUNS), at: now } }
-  const keys = Object.keys(next)
-  if (keys.length <= MAX_COMMANDS) return next
-  const keep = keys.sort((a, b) => next[b]!.at - next[a]!.at).slice(0, MAX_COMMANDS)
-  return Object.fromEntries(keep.map(k => [k, next[k]!]))
+export function entryMedian(e: Entry | null): number | null {
+  return e === null ? null : median(e.runs)
 }
 
-/** 讀回 store 的值:形狀不對的項目丟掉(store 是舊版或別人寫壞的)。 */
-export function asHistory(v: unknown): History {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return {}
-  const out: Record<string, { runs: readonly number[]; at: number }> = {}
-  for (const [k, e] of Object.entries(v as Record<string, unknown>)) {
-    if (typeof e !== 'object' || e === null) continue
-    const { runs, at } = e as { runs?: unknown; at?: unknown }
-    if (!Array.isArray(runs) || typeof at !== 'number') continue
-    const ok = runs.filter((x): x is number => typeof x === 'number' && Number.isFinite(x) && x > 0)
-    if (ok.length > 0) out[k] = { runs: ok.slice(-MAX_RUNS), at }
-  }
-  return out
+/** 讀回 store 的值:形狀不對、或 90 天沒寫入,都當作沒有。 */
+export function asEntry(v: unknown, now: number): Entry | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null
+  const { runs, at, phased } = v as { runs?: unknown; at?: unknown; phased?: unknown }
+  if (!Array.isArray(runs) || typeof at !== 'number' || now - at > MAX_AGE_MS) return null
+  const ok = runs.filter((x): x is number => typeof x === 'number' && Number.isFinite(x) && x > 0).slice(-MAX_RUNS)
+  return ok.length > 0 ? { runs: ok, at, phased: phased === true } : null
+}
+
+/** 超過 200 個指令時要刪的鍵:最久沒寫入的那幾個。 */
+export function evictKeys(ats: readonly (readonly [string, number])[], max = MAX_COMMANDS): string[] {
+  if (ats.length <= max) return []
+  return [...ats].sort((a, b) => a[1] - b[1]).slice(0, ats.length - max).map(([k]) => k)
 }

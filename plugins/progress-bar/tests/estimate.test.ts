@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { CAP, fitAdd, fitEval, lookup, median, rate, record, step, target, targetRate } from '../hooks/est'
+import {
+  addRun, asEntry, CAP, entryMedian, etaFromReading, evictKeys, fitAdd, fitEval, frameDt, hashCommand, MAX_LEAD, median,
+  rate, step, target, targetRate,
+} from '../hooks/est'
 import type { Fit } from '../hooks/est'
 
 /** 固定種子的亂數(mulberry32):每次跑都是同一串 */
@@ -131,28 +134,76 @@ describe('控制器', () => {
   })
 })
 
-describe('歷史', () => {
+describe('長間隔與時間倒退(cc-mods#1 verify R1 #7、#20)', () => {
+  test('兩拍之間隔很久(休眠、事件迴圈卡住):每拍的 dt 有上限,顯示值不會超前目標', () => {
+    expect(frameDt(1000, 1250)).toBe(0.25)
+    expect(frameDt(1000, 121_000)).toBe(0.5)
+    expect(frameDt(5000, 1000)).toBe(0)
+    // 只靠歷史、每秒 1/6 個百分點的目標:一次 120 秒的空檔之後,顯示值不超過目標太多
+    const vt = 100 / 600
+    let d = 10
+    const tgt = 30
+    d = step(d, tgt, vt, frameDt(0, 120_000))
+    expect(d <= tgt + vt * 0.5 + 1e-9).toBe(true)
+  })
+
+  test('時間倒退:原點不動、最後讀數更新、沒有 NaN;之後的讀數照常算斜率', () => {
+    const f = fitAdd(fitAdd(null, 10, 20), 5, 25)
+    expect(f.tLast).toBe(10)
+    expect(f.pLast).toBe(25)
+    expect(Number.isFinite(fitEval(f).level)).toBe(true)
+    const g = fitAdd(f, 20, 35)
+    expect((fitEval(g).slope ?? 0) > 0).toBe(true)
+  })
+
+  test('還要多久(讀數那一支):用最後讀數算;讀數 100% 時不顯示', () => {
+    expect(etaFromReading(40, 2)).toBe(30)
+    expect(etaFromReading(100, 2)).toBe(null)
+    expect(etaFromReading(50, 0)).toBe(null)
+  })
+
+  test('MAX_LEAD 有匯出,測試的上界跟著它', () => {
+    expect(MAX_LEAD > 0).toBe(true)
+  })
+})
+
+describe('歷史(雜湊鍵、每個指令一筆)', () => {
   test('中位數', () => {
     expect(median([3, 1, 2])).toBe(2)
     expect(median([4, 1, 3, 2])).toBe(2.5)
     expect(median([])).toBe(null)
   })
 
-  test('同一個指令字串:只留最近 5 次,查到的是中位數;字串不同就查不到', () => {
-    let h = {}
-    for (const [i, ms] of [10, 20, 30, 40, 50, 60].entries()) h = record(h, 'pytest -q', ms, i)
-    expect(lookup(h, 'pytest -q')).toBe(40)                   // 20, 30, 40, 50, 60
-    expect(lookup(h, 'pytest -q ')).toBe(null)
+  test('指令字串的雜湊:16 位十六進位;同一字串同一雜湊,差一個空白就不同;不含原字串', () => {
+    const a = hashCommand('curl -H "Authorization: Bearer secret" https://x')
+    expect(/^[0-9a-f]{16}$/.test(a)).toBe(true)
+    expect(hashCommand('curl -H "Authorization: Bearer secret" https://x')).toBe(a)
+    expect(hashCommand('curl -H "Authorization: Bearer secret" https://x ')).not.toBe(a)
+    expect(a.includes('secret')).toBe(false)
+    expect(hashCommand('')).toBe(hashCommand(''))
   })
 
-  test('超過 200 個指令時丟掉最久沒寫入的;不改動原本的物件', () => {
-    let h = {}
-    for (let i = 0; i < 201; i++) h = record(h, `cmd ${i}`, 1000, i)
-    expect(Object.keys(h).length).toBe(200)
-    expect(lookup(h, 'cmd 0')).toBe(null)
-    expect(lookup(h, 'cmd 200')).toBe(1000)
-    const before = JSON.stringify(h)
-    record(h, 'cmd new', 5, 999)
-    expect(JSON.stringify(h)).toBe(before)
+  test('每個指令只留最近 5 次;中位數;分段只要有一次就記著', () => {
+    let e = null as ReturnType<typeof addRun> | null
+    for (const [i, ms] of [10, 20, 30, 40, 50, 60].entries()) e = addRun(e, ms, i, i === 2)
+    expect(e?.runs).toEqual([20, 30, 40, 50, 60])
+    expect(entryMedian(e)).toBe(40)
+    expect(e?.phased).toBe(true)
+    expect(entryMedian(null)).toBe(null)
+  })
+
+  test('讀回時驗證形狀;90 天沒寫入的當作沒有', () => {
+    const now = 100 * 86_400_000
+    expect(asEntry({ runs: [1000, 'x', -5], at: now, phased: true }, now)).toEqual({ runs: [1000], at: now, phased: true })
+    expect(asEntry({ runs: [1000], at: now - 91 * 86_400_000, phased: false }, now)).toBe(null)
+    expect(asEntry({ runs: [], at: now }, now)).toBe(null)
+    expect(asEntry('nope', now)).toBe(null)
+    expect(asEntry({ runs: [1000], at: now }, now)?.phased).toBe(false)
+  })
+
+  test('超過 200 個指令:淘汰最久沒寫入的', () => {
+    const ats = Array.from({ length: 203 }, (_, i) => [`h2:${i}`, i] as [string, number])
+    expect(evictKeys(ats)).toEqual(['h2:0', 'h2:1', 'h2:2'])
+    expect(evictKeys(ats.slice(0, 200))).toEqual([])
   })
 })
