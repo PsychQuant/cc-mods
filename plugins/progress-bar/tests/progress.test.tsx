@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { bar, elapsed, expandPath, readProgress, redirectTargets } from '../hooks/parse'
+import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from '../hooks/parse'
 
 describe('readProgress', () => {
   test('最後一個百分比;pytest 的 [ NN%] 也算', () => {
@@ -43,6 +43,22 @@ test('bar 與 elapsed', () => {
   expect(elapsed(45_000)).toBe('45s')
   expect(elapsed(12 * 60_000)).toBe('12m')
   expect(elapsed(65 * 60_000)).toBe('1h05m')
+})
+
+test('長條用八分之一格;百分比一位小數;還要多久', () => {
+  expect(bar(55, 10)).toBe('█████▌░░░░')
+  expect(bar(51.25, 10)).toBe('█████▏░░░░')
+  expect(bar(99.9, 10)).toBe('█████████▉')
+  expect(bar(55, 10).length).toBe(10)
+  expect(pct(0)).toBe('  0.0%')
+  expect(pct(42.04)).toBe(' 42.0%')
+  expect(pct(100)).toBe('100.0%')
+  expect(etaText(42_000)).toBe('還要 42s')
+  expect(etaText(59_400)).toBe('還要 60s')
+  expect(etaText(3.4 * 60_000)).toBe('還要約 3m')
+  expect(etaText(65 * 60_000)).toBe('還要約 1h05m')
+  expect(etaText(0)).toBe('比平常久')
+  expect(etaText(-5000)).toBe('比平常久')
 })
 
 const BAND = {

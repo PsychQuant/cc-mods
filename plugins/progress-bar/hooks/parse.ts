@@ -59,10 +59,29 @@ export function expandPath(raw: string, env: Readonly<Record<string, string | un
   return path.startsWith('/') ? path : undefined
 }
 
-/** `█` 與 `░` 畫的長條,寬 `width` 格。 */
+const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
+
+/**
+ * `█` 與 `░` 畫的長條,寬 `width` 格;最後一格用八分之一格(`▏`–`▉`),解析度是 `width × 8`。
+ * 無條件捨去:只有 100% 才是滿格(執行中的上限 99.5% 不會畫成已經跑完)。
+ */
 export function bar(percent: number, width = 20): string {
-  const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)))
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
+  const units = Math.max(0, Math.min(width * 8, Math.floor((percent / 100) * width * 8 + 1e-9)))
+  const full = Math.floor(units / 8)
+  const part = EIGHTHS[units % 8] ?? ''
+  return '█'.repeat(full) + part + '░'.repeat(width - full - (part === '' ? 0 : 1))
+}
+
+/** 百分比,一位小數,寬 6(`  0.0%`–`100.0%`)。 */
+export function pct(percent: number): string {
+  return `${percent.toFixed(1)}%`.padStart(6)
+}
+
+/** 還要多久:一分鐘以內以秒計,以上取到分;0 或負的(跑得比歷史久)寫「比平常久」。 */
+export function etaText(ms: number): string {
+  if (!(ms > 0)) return '比平常久'
+  if (ms < 60_000) return `還要 ${Math.ceil(ms / 1000)}s`
+  return `還要約 ${elapsed(Math.round(ms / 60_000) * 60_000)}`
 }
 
 /** 經過時間:`45s`、`12m`、`1h05m`。 */
