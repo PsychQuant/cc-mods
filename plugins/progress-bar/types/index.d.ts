@@ -20,6 +20,6 @@ export type Tracked = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'progress-bar': { tasks: Shaped<Tracked[]>; now: number }
+    'progress-bar': { tasks: Shaped<Tracked[]>; now: number; outputDir: string | null }
   }
 }

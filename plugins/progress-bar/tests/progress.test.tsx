@@ -102,6 +102,8 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
     expect(text).toContain('42%')
     expect(text).toContain('█')
+    // 疊在下面的東西照樣畫(同一條 band 上的其他 mod 不被蓋掉)
+    expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
     await ui.unmount()
   }
 
@@ -144,5 +146,73 @@ test('不是背景跑的 Bash 不畫', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /ls/ })).toBe(undefined)
   expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
+  await ui.unmount()
+})
+
+const fileStat = (size: number, mtimeMs: number) => ({ value: { kind: 'file', size, mtimeMs, isLink: false } }) as const
+const noFile = { value: { kind: 'other', size: 0, mtimeMs: 0, isLink: false } } as const
+
+test('已經在跑的背景 shell:每一輪結束時接上,讀它重導向的檔', async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000_000 })
+  engineDraws(on)
+  mock.env(on, { HOME: '/Users/me', CLAUDE_JOB_DIR: '/jobs/1' })
+  const log = 'tests/a.py ....  [ 63%]\n'
+  on('fs.stat', (_, e) => (e.path === LOG ? fileStat(log.length, 7) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === LOG ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))   // 引擎這一端:沒有任何決定
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  await $.classic.Stop({
+    stop_hook_active: false,
+    background_tasks: [
+      { id: 'b9', type: 'shell', status: 'running', description: 'Old pytest run', command: 'pytest -q > $CLAUDE_JOB_DIR/tmp/pytest.log 2>&1' },
+      { id: 'a1', type: 'subagent', status: 'running', description: 'Some agent' },
+    ],
+  })
+  await clock.advance(2000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Old pytest run/ }))?.text ?? '').toContain('63%')
+  // 不是 shell 的背景工作也顯示一列:名字與經過時間,沒有長條
+  const agent = (await ui.find({ type: 'Text', text: /Some agent/ }))?.text ?? ''
+  expect(agent.startsWith('⋯ Some agent')).toBe(true)
+  await ui.unmount()
+
+  // 下一輪結束時清單裡沒有了:當作結束(沒有結束通知也收得起來),15 秒後收起
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  const done = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await done.find({ type: 'Text', text: /Some agent/ }))?.text ?? '').toContain('ended')
+  await done.unmount()
+  await clock.advance(20_000)
+  const gone = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await gone.find({ type: 'Text', text: /Some agent/ })).toBe(undefined)
+  await gone.unmount()
+})
+
+test('沒有重導向的 shell:從學到的輸出資料夾讀 <id>.output', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_000_000 })
+  engineDraws(on)
+  const dir = '/tmp/claude-9/proj/sess/tasks'
+  const out = 'Downloading  37%\r'
+  on('fs.stat', (_, e) => (e.path === `${dir}/b7.output` ? fileStat(out.length, 3) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === `${dir}/b7.output` ? out : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  on('tool.call', () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b6' },
+    text: `Command running in background with ID: b6. Output is being written to: ${dir}/b6.output. You will be notified.`,
+  }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'sleep 1', run_in_background: true, description: 'Learn dir' })
+
+  await $.classic.Stop({
+    stop_hook_active: false,
+    background_tasks: [{ id: 'b7', type: 'shell', status: 'running', description: 'Download data', command: 'curl -O https://example.com/data.zip' }],
+  })
+  await clock.advance(2000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Download data/ }))?.text ?? '').toContain('37%')
   await ui.unmount()
 })

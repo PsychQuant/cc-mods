@@ -8,6 +8,8 @@ import { bar, elapsed, expandPath, readProgress, redirectTargets } from './parse
 const tasks = atom({ plugin: 'progress-bar', key: 'tasks' } as const, [] as Tracked[], { shape: 'tasks-1' })
 // 每一拍寫一次現在的時間,讓經過時間跟著重畫
 const now = atom({ plugin: 'progress-bar', key: 'now' } as const, 0)
+// 這個 session 背景任務輸出檔所在的資料夾:從第一個背景 Bash 的結果學到,接上已經在跑的任務時用
+const outputDir = atom({ plugin: 'progress-bar', key: 'outputDir' } as const, null as string | null)
 
 const POLL_MS = 2000
 const KEEP_DONE_MS = 15_000            // 結束後再顯示多久
@@ -83,7 +85,7 @@ async function tick($: EngineInterface, mtimes: Map<string, number>): Promise<vo
 function row(x: Tracked, t: number, width: number): string {
   const took = elapsed((x.endedAt ?? t) - x.startedAt)
   if (x.endedAt !== null) {
-    const mark = x.status === 'completed' ? '✓' : '✗'
+    const mark = x.status === 'completed' ? '✓' : x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
     const pct = x.percent === null ? '' : ` ${x.percent}%`
     return `${mark} ${x.label}${pct} · ${x.status ?? 'ended'} · ${took}`
   }
@@ -108,25 +110,66 @@ export const register: Register = on => {
     if (id === undefined) return ran
     try {
       const output = OUTPUT.exec(ran.text ?? '')?.[1]
-      const files = await filesOf($, e.command, output)
-      if (files.length > 0) {
-        const tracked: Tracked = {
-          id,
-          label: (e.description ?? e.command).replace(/\s+/g, ' ').slice(0, 48),
-          files,
-          startedAt: await $.clock.now(),
-          percent: null,
-          line: '',
-          endedAt: null,
-          status: null,
-        }
-        await update($, tasks, list => [...list.filter(x => x.id !== id), tracked].slice(-MAX_TASKS))
+      const own = `/${id}.output`
+      if (output !== undefined && output.endsWith(own)) {
+        const dir = output.slice(0, -own.length)
+        await update($, outputDir, () => dir)
       }
+      // 讀不到檔也照樣記下:沒有百分比的任務顯示名字與經過時間
+      const tracked: Tracked = {
+        id,
+        label: (e.description ?? e.command).replace(/\s+/g, ' ').slice(0, 48),
+        files: await filesOf($, e.command, output),
+        startedAt: await $.clock.now(),
+        percent: null,
+        line: '',
+        endedAt: null,
+        status: null,
+      }
+      await update($, tasks, list => [...list.filter(x => x.id !== id), tracked].slice(-MAX_TASKS))
     } catch {
       // 只是顯示,記不起來就不畫
     }
     return ran
   }).catch(($, e, next) => next(e))   // 這個 hook 壞了也不擋指令:照原樣跑
+
+  // 每一輪結束:對照引擎列出的背景工作(shell、subagent、workflow、monitor)。
+  // (1) 還在跑、但沒被記下的接上(例如 mod 載入之前就開始跑的);只有 shell 讀檔,其他種類只顯示名字與經過時間。
+  //     接上的這一列沒有開始時間,經過時間從接上的那一刻算。
+  // (2) 記著、但已經不在清單裡的,當作結束(沒有結束通知的種類也收得起來)
+  on('classic.Stop', async ($, e, next) => {
+    const r = await next(e)
+    if (e.background_tasks === undefined) return r       // 引擎沒給清單:不猜
+    const running = e.background_tasks.filter(b => b.status === 'running' || b.status === 'pending')
+    const live = new Set(running.map(b => b.id))
+    const list = await read($, tasks)
+    const known = new Set(list.map(x => x.id))
+    const dir = await read($, outputDir)
+    const t = await $.clock.now()
+    const picked: Tracked[] = []
+    for (const b of running) {
+      if (known.has(b.id)) continue
+      const isShell = b.type === 'shell'
+      picked.push({
+        id: b.id,
+        label: (b.description || b.name || b.agent_type || b.command || b.id).replace(/\s+/g, ' ').slice(0, 48),
+        files: isShell ? await filesOf($, b.command ?? '', dir === null ? undefined : `${dir}/${b.id}.output`) : [],
+        startedAt: t,
+        percent: null,
+        line: '',
+        endedAt: null,
+        status: null,
+      })
+    }
+    const gone = new Set(list.filter(x => x.endedAt === null && !live.has(x.id)).map(x => x.id))
+    if (picked.length > 0 || gone.size > 0) {
+      await update($, tasks, latest => [
+        ...latest.map(x => (gone.has(x.id) && x.endedAt === null ? { ...x, endedAt: t, status: x.status ?? 'ended' } : x)),
+        ...picked.filter(p => !latest.some(x => x.id === p.id)),
+      ].slice(-MAX_TASKS))
+    }
+    return r
+  }).catch(($, e, next) => next(e))   // 壞了也不影響這一輪的結束
 
   // 背景任務結束的通知:`<task-id>` 與 `<status>`
   on('session.append', async ($, e, next) => {
@@ -146,20 +189,24 @@ export const register: Register = on => {
     return r
   }).catch(($, e, next) => next(e))   // 壞了也照原樣存這一列
 
+  // 疊在下面的 plugin(或引擎)畫的東西上方,不取代它:同一條 band 上的其他 mod(例如 token-weather)照樣畫得出來
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, tasks)
     if (e.props.hasSurvey || list.length === 0) return next(e)
+    const below = await next(e)
     const t = Math.max(await read($, now), ...list.map(x => x.startedAt))
     const width = Math.max(10, Math.min(30, e.props.bodyColumns - 60))
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
+        {below}
         {list.map(x => (
           <Box key={x.id}>
             <Text
               wrap="truncate-end"
-              color={x.endedAt === null ? undefined : x.status === 'completed' ? 'green' : 'red'}
-              dimColor={x.endedAt === null && x.percent === null}
+              color={x.endedAt === null ? undefined
+                : x.status === 'completed' ? 'green' : x.status === 'failed' || x.status === 'killed' ? 'red' : undefined}
+              dimColor={(x.endedAt === null && x.percent === null) || (x.endedAt !== null && x.status === 'ended')}
             >
               {row(x, t, width)}
             </Text>
