@@ -1,2 +1,5 @@
 # 引擎載入 mod 時寫的型別檔,每次重產
 plugins/*/.claude-plugin/types/
+
+# IDD tree-lock (idd-tree-lock.sh #183) — per-machine session state, not tracked
+.claude/.idd/tree-lock
