@@ -529,10 +529,7 @@ export const register: Register = on => {
     const r = await next(e)
     // next(e) 已經跑過了:之後的錯誤在這裡接住(丟出去的話引擎把這個 hook 記成被跳過;這一列照樣只存一次)
     try {
-      // 通知有兩種送法,只收這兩種列:閒置時是一列 user;送進正在跑的那一輪時是一列 attachment
-      // (queued_command),漏收這種的話,任務只會在一輪結束時被推定結束、到不了 ✓ 100%(#2)。
-      // 不用 origin 判斷(送進那一輪的通知,origin 可能是 engine),也不比 attachment 的名稱(名稱隨版本增減)
-      if (e.message.type !== 'user' && e.message.type !== 'attachment') return r
+      if (e.message.type !== 'user') return r
       const text = JSON.stringify(e.message)
       if (!text.includes('<task-id>')) return r
       const ends = new Map<string, string>()
