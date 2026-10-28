@@ -290,7 +290,7 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
       drop.add(task.id)
       continue
     }
-    // 結束之後再讀一兩拍,最後的百分比(常常是 100%)才會畫上去
+    // 結束之後再讀一兩拍:failed、killed、推定結束的列寫的是最後的百分比(completed 的列一律畫滿,不靠這一拍)
     if (task.endedAt !== null && t - task.endedAt > 2 * POLL_MS) continue
     let cur: Tracked = task
     for (const f of task.files) {
@@ -546,8 +546,10 @@ export const register: Register = on => {
       // 推定結束了的也建:每一輪結束時先寫任務、再寫待寫清單,通知可能剛好插在中間(verify R3 #1)。長度用推定結束的那一刻
       const fresh = list.filter(x => open(x) && recordable(x, x.endedAt ?? t))
         .map(x => pendingOf(x, x.endedAt ?? t, ends.get(x.id) ?? null))
+      // 推定結束的列收到通知才更正:結束時間改成通知到的那一刻,收起前的 15 秒從這裡算,
+      // 滿格的長條才看得到(#2 verify R2)。歷史的長度不受影響 —— 上面那一筆照舊用推定結束的那一刻
       await update($, tasks, l => l.map(x => (open(x)
-        ? { ...x, endedAt: x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
+        ? { ...x, endedAt: x.presumed ? t : x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
         : x)))
       await update($, pending, latest => capPending([
         ...latest.map(p => (ends.has(p.id) && p.status === null ? { ...p, status: ends.get(p.id) ?? null } : p)),

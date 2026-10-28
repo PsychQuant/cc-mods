@@ -571,7 +571,7 @@ test('跑完的那一列畫滿格的長條與 100.0% 再打勾,讀數只到 83% 
   await $.tool.call({ tool: 'Bash', command: 'make check', description: 'Check', run_in_background: true })
   await clock.advance(6000)
   const running = await rowText($, /Check/)
-  expect(shownPct(running) < 100).toBe(true)                    // 執行中停在 100 之前(讀數只到 83%)
+  expect(shownPct(running) <= 83 + MAX_LEAD).toBe(true)         // 執行中最多比最後讀數多 MAX_LEAD(停在九成多)
   await $.session.append(ended('f2'))
   const done = await rowText($, /Check/)
   expect(done).toContain(`▕${'█'.repeat(30)}▏`)                // 長條畫滿(BAND 的寬度是 30 格)
@@ -580,6 +580,58 @@ test('跑完的那一列畫滿格的長條與 100.0% 再打勾,讀數只到 83% 
   expect(done).toContain('completed')
   await clock.advance(20_000)
   expect(await rowText($, /Check/)).toBe('')
+})
+
+test('先被推定結束、10 秒後才收到 completed:滿格的長條從通知到的那一刻起留 15 秒(#2 verify R2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_960_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'q2')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make slow', description: 'Slow', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束
+  await clock.advance(10_000)
+  await $.session.append(ended('q2'))
+  await clock.advance(10_000)                                    // 推定結束後 20 秒、通知後 10 秒
+  const shown = await rowText($, /Slow/)
+  expect(shown).toContain(`▕${'█'.repeat(30)}▏ 100.0% ✓`)
+  expect(runsOf(mem, 'make slow').map(r => r.ms)).toEqual([6000])   // 歷史的長度照舊取推定結束那一刻
+  await clock.advance(10_000)                                    // 通知後 20 秒:收起
+  expect(await rowText($, /Slow/)).toBe('')
+})
+
+test('沒有任何讀數(只轉圈)的任務跑完也畫滿;窄的 band 上長條照寬度畫滿,經過時間照寫', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_970_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's9')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'pip install x', description: 'Install', run_in_background: true })
+  await clock.advance(5000)
+  expect(await rowText($, /Install/)).toMatch(SPINNER)          // 執行中只轉圈
+  await $.session.append(ended('s9'))
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 50 } })
+  const narrow = (await ui.find({ type: 'Text', text: /Install/ }))?.text ?? ''
+  await ui.unmount()
+  expect(narrow).toBe(`▕${'█'.repeat(10)}▏ 100.0% ✓ Install · completed · 5s`)   // 寬度下限 10 格
+})
+
+test('killed 的那一列也不畫長條', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_980_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'k9')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make c', description: 'Job C', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('k9', 'killed'))
+  expect(await rowText($, /Job C/)).toBe('✗ Job C · killed · 3s')
 })
 
 test('failed 與推定結束的那一列不畫長條(只有 completed 畫滿)', async ($, on) => {
