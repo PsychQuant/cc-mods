@@ -270,13 +270,13 @@ function shownD(id: string): number | null {
   return w === undefined || w.spin ? null : w.d
 }
 
-/** 讀一次每個還在跑(或剛結束)的任務的檔,有變才寫回;重試寫不進的歷史;看顯示時鐘還在不在跑。 */
 /** 這一列該收起了:結束(或推定結束後收到通知)超過 KEEP_DONE_MS,或開始超過 STALE_MS。keepFrom 是舊狀態沒有的欄位 */
 const isGone = (x: Tracked, t: number): boolean => {
   const from = x.keepFrom ?? x.endedAt
   return (from !== null && t - from > KEEP_DONE_MS) || t - x.startedAt > STALE_MS
 }
 
+/** 讀一次每個還在跑(或剛結束)的任務的檔,有變才寫回;重試寫不進的歷史;看顯示時鐘還在不在跑。 */
 async function tick($: EngineInterface, gen: number): Promise<void> {
   const t = await $.clock.now()
   if (gen !== pollGen) return
