@@ -268,6 +268,20 @@ const ended = (id: string, status = 'completed') => ({
   uuid: `u-${id}`,
 }) as never
 
+/** 同一則通知送進正在跑的那一輪:不是 user 列,是一列 attachment(queued_command),origin 是引擎(#2) */
+const midTurn = (id: string, status = 'completed') => ({
+  message: {
+    type: 'attachment',
+    name: 'queued_command',
+    role: 'user',
+    isMeta: true,
+    content: [{ type: 'text', text: `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n</task-notification>` }],
+  },
+  door: 'attachment',
+  origin: { kind: 'engine' },
+  uuid: `a-${id}`,
+}) as never
+
 const background = (on: On, id: () => string) =>
   on('tool.call', () => ({
     result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id() },
@@ -556,6 +570,32 @@ test('每一輪結束時先被推定結束、之後才到的 completed 通知:�
   await $.session.append(ended('p1'))
   expect(runsOf(mem, 'make docs').map(r => r.ms)).toEqual([10_000])   // 長度取推定結束那一刻,不是通知到達的那一刻
   expect((await rowText($, /Docs/))).toContain('completed')
+})
+
+test('一輪還在跑時送到的結束通知(attachment 列):立刻打勾、畫 100%,一輪結束時不改成推定結束(#2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_800_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  const out = '/tmp/tasks/n1.output'
+  const log = 'tests/a.py ....  [ 42%]\n'
+  on('fs.stat', (_, e) => (e.path === out ? fileStat(log.length, 1) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === out ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'n1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make check', description: 'Check', run_in_background: true })
+  await clock.advance(4000)
+  expect(await rowText($, /Check/)).toContain('█')   // 還在跑
+  await $.session.append(midTurn('n1'))
+  const done = await rowText($, /Check/)
+  expect(done).toContain('✓')
+  expect(done).toContain('100%')
+  expect(done).toContain('completed')
+  expect(runsOf(mem, 'make check').map(r => r.ms)).toEqual([4000])
+  // 這一輪結束時它已經不在背景清單裡:已經收到通知的,不再推定結束
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  expect(await rowText($, /Check/)).toBe(done)
 })
 
 
