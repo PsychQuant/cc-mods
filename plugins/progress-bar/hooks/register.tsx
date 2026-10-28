@@ -271,6 +271,12 @@ function shownD(id: string): number | null {
 }
 
 /** 讀一次每個還在跑(或剛結束)的任務的檔,有變才寫回;重試寫不進的歷史;看顯示時鐘還在不在跑。 */
+/** 這一列該收起了:結束(或推定結束後收到通知)超過 KEEP_DONE_MS,或開始超過 STALE_MS。keepFrom 是舊狀態沒有的欄位 */
+const isGone = (x: Tracked, t: number): boolean => {
+  const from = x.keepFrom ?? x.endedAt
+  return (from !== null && t - from > KEEP_DONE_MS) || t - x.startedAt > STALE_MS
+}
+
 async function tick($: EngineInterface, gen: number): Promise<void> {
   const t = await $.clock.now()
   if (gen !== pollGen) return
@@ -285,12 +291,12 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
   // 這一拍讀到的 mtime 先記在這裡,讀數寫回去了才併進 mtimes:讀檔失敗、或這一拍已經被換掉時,下一拍還會再讀(verify R3 #2)
   const seen = new Map<string, number>()
   for (const task of list) {
-    const isOver = task.endedAt !== null && t - task.endedAt > KEEP_DONE_MS
-    if (isOver || t - task.startedAt > STALE_MS) {
+    if (isGone(task, t)) {
       drop.add(task.id)
       continue
     }
-    // 結束之後再讀一兩拍:failed、killed、推定結束的列寫的是最後的百分比(completed 的列一律畫滿,不靠這一拍)
+    // 結束之後再讀一兩拍:failed、killed、推定結束的列寫最後顯示的百分比(final);結束時還沒畫過(final 是 null)才用
+    // 這一拍讀到的讀數。completed 的列一律畫滿,不靠這一拍
     if (task.endedAt !== null && t - task.endedAt > 2 * POLL_MS) continue
     let cur: Tracked = task
     for (const f of task.files) {
@@ -322,7 +328,8 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
     await update($, tasks, latest => {
       if (gen !== pollGen) return latest
       committed = true
-      return latest.filter(x => !drop.has(x.id)).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x))
+      // 只收掉現在仍該收的:讀檔的時候結束通知可能剛到,那一列的收起時間已經往後延(#2 verify R3)
+      return latest.filter(x => !(drop.has(x.id) && isGone(x, t))).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x))
     })
   }
   if (!committed || gen !== pollGen) return
@@ -546,10 +553,11 @@ export const register: Register = on => {
       // 推定結束了的也建:每一輪結束時先寫任務、再寫待寫清單,通知可能剛好插在中間(verify R3 #1)。長度用推定結束的那一刻
       const fresh = list.filter(x => open(x) && recordable(x, x.endedAt ?? t))
         .map(x => pendingOf(x, x.endedAt ?? t, ends.get(x.id) ?? null))
-      // 推定結束的列收到通知才更正:結束時間改成通知到的那一刻,收起前的 15 秒從這裡算,
-      // 滿格的長條才看得到(#2 verify R2)。歷史的長度不受影響 —— 上面那一筆照舊用推定結束的那一刻
+      // 收起前的 15 秒從通知到的那一刻算(keepFrom):推定結束之後才收到通知的,滿格的長條才看得到(#2 verify R2)。
+      // 結束時間不改 —— 畫面上的經過時間與歷史的長度一樣,到推定結束那一刻(verify R3)。
+      // 同一則通知又來一次時 open() 不成立(presumed 已清掉),不會再往後延
       await update($, tasks, l => l.map(x => (open(x)
-        ? { ...x, endedAt: x.presumed ? t : x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
+        ? { ...x, endedAt: x.endedAt ?? t, keepFrom: t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
         : x)))
       await update($, pending, latest => capPending([
         ...latest.map(p => (ends.has(p.id) && p.status === null ? { ...p, status: ends.get(p.id) ?? null } : p)),

@@ -54,8 +54,10 @@ export type Tracked = {
   phase: number
   /** 輸出的最後一行(截短) */
   line: string
-  /** 任務結束的時間;還在跑是 null */
+  /** 任務結束的時間(推定結束的列是推定的那一刻,之後收到通知也不改);還在跑是 null */
   endedAt: number | null
+  /** 收起前的 15 秒從這一刻算:收到結束通知的那一刻;沒有(還沒收到通知,或舊版存的狀態)就用 endedAt */
+  keepFrom?: number | null
   /** 結束時的狀態(completed、failed、killed;每一輪結束時清單裡沒有了是 ended);還在跑是 null */
   status: string | null
   /** 只是從背景清單推定結束,還沒收到結束通知 */
