@@ -385,9 +385,12 @@ function isSpin(x: Tracked, s: Shown | undefined): boolean {
 function row(x: Tracked, s: Shown | undefined, t: number, width: number): string {
   const took = elapsed((x.endedAt ?? t) - x.startedAt)
   if (x.endedAt !== null) {
-    const mark = x.status === 'completed' ? '✓' : x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
-    // 結束那一刻不往回掉:completed 寫 100%,其餘寫最後的顯示值(verify R1 #16)
-    const last = x.status === 'completed' && (x.percent !== null || x.final !== null) ? 100 : x.final ?? x.percent
+    // 跑完的那一列把長條畫滿再打勾(#2):讀數稀疏時,執行中的長條停在九成多(最多比最後讀數多 MAX_LEAD),
+    // 只換成一行文字的話,長條從來沒畫滿,看起來像沒跑完
+    if (x.status === 'completed') return `▕${bar(100, width)}▏ ${pct(100)} ✓ ${x.label} · completed · ${took}`
+    const mark = x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
+    // 結束那一刻不往回掉:寫最後的顯示值(verify R1 #16)
+    const last = x.final ?? x.percent
     const p = last === null ? '' : ` ${Math.round(last * 10) / 10}%`
     return `${mark} ${x.label}${p} · ${x.status ?? 'ended'} · ${took}`
   }

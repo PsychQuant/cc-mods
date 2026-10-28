@@ -156,7 +156,7 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
     expect(text).toContain('✓')
     expect(text).toContain('completed')
-    expect(text).toContain('100%')          // 結束那一刻不往回掉(verify R1 #16)
+    expect(text).toContain('100.0%')        // 結束那一刻不往回掉(verify R1 #16);長條畫滿(#2)
     await ui.unmount()
   }
 
@@ -556,6 +556,53 @@ test('每一輪結束時先被推定結束、之後才到的 completed 通知:�
   await $.session.append(ended('p1'))
   expect(runsOf(mem, 'make docs').map(r => r.ms)).toEqual([10_000])   // 長度取推定結束那一刻,不是通知到達的那一刻
   expect((await rowText($, /Docs/))).toContain('completed')
+})
+
+test('跑完的那一列畫滿格的長條與 100.0% 再打勾,讀數只到 83% 也一樣;15 秒後收起(#2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_900_000 })
+  engineDraws(on)
+  const out = '/tmp/tasks/f2.output'
+  const log = 'tests/a.py ....  [ 83%]\n'
+  on('fs.stat', (_, e) => (e.path === out ? fileStat(log.length, 1) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === out ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'f2')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make check', description: 'Check', run_in_background: true })
+  await clock.advance(6000)
+  const running = await rowText($, /Check/)
+  expect(shownPct(running) < 100).toBe(true)                    // 執行中停在 100 之前(讀數只到 83%)
+  await $.session.append(ended('f2'))
+  const done = await rowText($, /Check/)
+  expect(done).toContain(`▕${'█'.repeat(30)}▏`)                // 長條畫滿(BAND 的寬度是 30 格)
+  expect(done).toContain('100.0%')
+  expect(done).toContain('✓')
+  expect(done).toContain('completed')
+  await clock.advance(20_000)
+  expect(await rowText($, /Check/)).toBe('')
+})
+
+test('failed 與推定結束的那一列不畫長條(只有 completed 畫滿)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_950_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  let id = 'x1'
+  background(on, () => id)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make a', description: 'Job A', run_in_background: true })
+  id = 'x2'
+  await $.tool.call({ tool: 'Bash', command: 'make b', description: 'Job B', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('x1', 'failed'))
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // x2 推定結束
+  const a = await rowText($, /Job A/)
+  const b = await rowText($, /Job B/)
+  expect(a).toContain('✗')
+  expect(a).not.toContain('█')
+  expect(b).toContain('ended')
+  expect(b).not.toContain('█')
 })
 
 

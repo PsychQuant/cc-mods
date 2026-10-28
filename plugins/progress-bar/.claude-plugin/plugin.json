@@ -1,6 +1,6 @@
 {
   "name": "progress-bar",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "背景跑的指令(pytest、安裝、下載)在提示列上方顯示進度條:讀輸出裡的百分比,兩次讀數之間依估計的速率往前走、顯示還要多久;沒有百分比時依同一個指令過去的長度估計,都沒有就轉圈",
   "author": {
     "name": "Che Cheng"
