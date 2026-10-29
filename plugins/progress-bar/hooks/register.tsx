@@ -8,7 +8,8 @@ import {
 } from './est'
 import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from './parse'
 
-// 欄位改了就換 shape:舊版存的值會被拒收,不會被讀成錯的形狀(重載之後 $.state 還在)
+// 欄位改了就換 shape:舊版存的值會被拒收,不會被讀成錯的形狀(重載之後 $.state 還在)。
+// 新增選填欄位(舊值沒有它也讀得對,例如 keepFrom)不換:換了會在重載時清空清單,正在跑的任務只能等下一輪以「接上」回來
 const tasks = atom({ plugin: 'progress-bar', key: 'tasks' } as const, [] as Tracked[], { shape: 'tasks-4' })
 // 每一拍寫一次現在的時間,讓經過時間跟著重畫
 const now = atom({ plugin: 'progress-bar', key: 'now' } as const, 0)
@@ -24,7 +25,7 @@ const POLL_STALE_MS = 3 * POLL_MS      // 輪詢時鐘這麼久沒跑,顯示時�
 const DISPLAY_MS = 250                 // 顯示時鐘:只算、不讀檔
 const STALE_FRAME_MS = 1000            // 顯示時鐘這麼久沒跑,2 秒的 tick 就重開它(verify R1 #2、#6)
 const SPIN_MS = 1000                   // 轉圈每秒一格:轉圈列 shown 每秒最多寫一次(verify R1 #13)
-const KEEP_DONE_MS = 15_000            // 結束後再顯示多久
+const KEEP_DONE_MS = 15_000            // 結束後再顯示多久;推定結束之後才收到通知的,從通知到的那一刻算(keepFrom)
 const STALE_MS = 6 * 60 * 60 * 1000    // 沒收到結束通知的任務(與待寫的歷史),最多留多久
 const MAX_TASKS = 6
 const MAX_TRIES = 3                    // 一次跑完的長度寫不進 store,最多試幾次
@@ -392,8 +393,8 @@ function isSpin(x: Tracked, s: Shown | undefined): boolean {
 function row(x: Tracked, s: Shown | undefined, t: number, width: number): string {
   const took = elapsed((x.endedAt ?? t) - x.startedAt)
   if (x.endedAt !== null) {
-    // 跑完的那一列把長條畫滿再打勾(#2):讀數稀疏時,執行中的長條停在九成多(最多比最後讀數多 MAX_LEAD),
-    // 只換成一行文字的話,長條從來沒畫滿,看起來像沒跑完
+    // 跑完的那一列把長條畫滿再打勾(#2):讀數稀疏時,執行中的長條常停在離 100% 還有一段的地方(目標最多領先
+    // MAX_LEAD,只有最低速度那一項會慢慢越過),只換成一行文字的話,長條從來沒畫滿,看起來像沒跑完
     if (x.status === 'completed') return `▕${bar(100, width)}▏ ${pct(100)} ✓ ${x.label} · completed · ${took}`
     const mark = x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
     // 結束那一刻不往回掉:寫最後的顯示值(verify R1 #16)

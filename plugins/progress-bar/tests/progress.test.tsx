@@ -293,15 +293,16 @@ function memoryStore(on: On): Record<string, unknown> {
 /**
  * 能拒絕某一期的時鐘(`mock.clock` 不能):`clock.now` 回這裡的時間,`clock.every` 每一期掛著、時鐘走到才放行;
  * `refuse(ms, n)` 為真的那一期回 `{ deny }`(第 n 期是這個週期的第 n 次派送,跨計時器累計)。一期被拒,那個 interval 就結束。
+ * `shift()` 從 `clock.now` 回的時間扣掉:只給一次的話,只有那一次讀到的時間落在過去(`mock.clock` 的 now 不能再疊一層)。
  */
 // 測試的執行環境有 setTimeout;型別設定刻意不含 DOM 與 Node,這裡自己宣告
 declare const setTimeout: (fn: () => void, ms: number) => unknown
 
-function refusingClock(on: On, start: number, refuse: (ms: number, n: number) => boolean) {
+function refusingClock(on: On, start: number, refuse: (ms: number, n: number) => boolean, shift: () => number = () => 0) {
   let t = start
   const waits: { due: number; resolve: () => void }[] = []
   const counts = new Map<number, number>()
-  on('clock.now', () => ({ value: t }))
+  on('clock.now', () => ({ value: t - shift() }))
   on('clock.every', async (_, e) => {
     const n = (counts.get(e.ms) ?? 0) + 1
     counts.set(e.ms, n)
@@ -571,7 +572,7 @@ test('跑完的那一列畫滿格的長條與 100.0% 再打勾,讀數只到 83% 
   await $.tool.call({ tool: 'Bash', command: 'make check', description: 'Check', run_in_background: true })
   await clock.advance(6000)
   const running = await rowText($, /Check/)
-  expect(shownPct(running) <= 83 + MAX_LEAD).toBe(true)         // 執行中最多比最後讀數多 MAX_LEAD(停在九成多)
+  expect(shownPct(running) <= 83 + MAX_LEAD).toBe(true)         // 第 6 秒還沒越過最後讀數加 MAX_LEAD:停在離 100% 還有一段
   await $.session.append(ended('f2'))
   const done = await rowText($, /Check/)
   expect(done).toContain(`▕${'█'.repeat(30)}▏`)                // 長條畫滿(BAND 的寬度是 30 格)
@@ -722,7 +723,70 @@ test('打叉與推定結束的列寫最後顯示的百分比(#2 verify R3)', asy
   const pctOf = (t: string) => Number((t.match(/ (\d+(?:\.\d)?)% · /) ?? [])[1])
   expect(f).toMatch(/^✗ Job F \d+(\.\d)?% · failed · 6s$/)
   expect(p).toMatch(/^· Job P \d+(\.\d)?% · ended · 6s$/)
-  for (const v of [pctOf(f), pctOf(p)]) expect(v >= 42 && v <= 42 + MAX_LEAD + 0.5).toBe(true)
+  // 寫的是結束那一刻的顯示值,不是最後讀數 42(#2 verify R5:範圍同時接受兩者時,改成讀數的變異殺不掉)
+  for (const v of [pctOf(f), pctOf(p)]) expect(v > 42 && v <= 42 + MAX_LEAD + 0.5).toBe(true)
+})
+
+test('先被推定結束、之後才收到 failed:列上照舊寫推定結束那一刻的顯示值(#2 verify R5)', async ($, on) => {
+  const clock = mock.clock(on, { now: 23_000_000 })
+  engineDraws(on)
+  const log = 'tests/a.py ....  [ 42%]\n'
+  on('fs.stat', (_, e) => (e.path === '/tmp/tasks/d5.output' ? fileStat(log.length, 1) : noFile))
+  on('fs.read', () => ({ value: log }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'd5')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make d5', description: 'Job D', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束:記下這一刻的顯示值
+  const before = await rowText($, /Job D/)
+  await clock.advance(10_000)                                    // 顯示時鐘已經不再記著這個任務
+  await $.session.append(ended('d5', 'failed'))
+  const after = await rowText($, /Job D/)
+  const pctOf = (t: string) => Number((t.match(/ (\d+(?:\.\d)?)% · /) ?? [])[1])
+  expect(pctOf(before) > 42).toBe(true)
+  expect(after).toMatch(/^✗ Job D \d+(\.\d)?% · failed · 6s$/)
+  expect(pctOf(after)).toBe(pctOf(before))                       // 晚到的通知不把它換成最後讀數 42
+})
+
+test('跑不到 2 秒、先被推定結束、之後才收到 completed:不寫歷史(門檻取推定結束那一刻;#2 verify R5)', async ($, on) => {
+  const clock = mock.clock(on, { now: 24_000_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'k1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make quick', description: 'Quick', run_in_background: true })
+  await clock.advance(1500)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束:跑了 1.5 秒
+  await clock.advance(3000)                                      // 通知到的時候已經過了 4.5 秒
+  await $.session.append(ended('k1'))
+  expect(runsOf(mem, 'make quick')).toEqual([])
+  expect(await rowText($, /Quick/)).toContain('100.0% ✓')
+})
+
+test('沒收到結束通知的任務:開始 6 小時後收起(#2 verify R5)', async ($, on) => {
+  // 只讓 tool.call 記下的開始時間落在 6 小時少 4 秒之前,不必把時鐘真的推 6 小時
+  let back = 0
+  const clock = refusingClock(on, 30_000_000, () => false, () => {
+    const b = back
+    back = 0
+    return b
+  })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's6')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  back = 6 * 60 * 60 * 1000 - 4000
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99999', description: 'Forever', run_in_background: true })
+  await clock.advance(2000)                                      // 開始後 6 小時少 2 秒:還在
+  expect(await rowText($, /Forever/)).not.toBe('')
+  await clock.advance(4000)                                      // 開始後 6 小時又 2 秒:收起
+  expect(await rowText($, /Forever/)).toBe('')
 })
 
 test('通知剛好在 tick 讀完清單之後才到:那一列不被這一拍的舊判斷收掉(#2 verify R3)', async ($, on) => {
