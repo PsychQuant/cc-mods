@@ -156,7 +156,7 @@ test('背景 Bash 的進度畫在提示列上方,結束後打勾、15 秒後收�
     const text = (await ui.find({ type: 'Text', text: /Run full pytest suite/ }))?.text ?? ''
     expect(text).toContain('✓')
     expect(text).toContain('completed')
-    expect(text).toContain('100%')          // 結束那一刻不往回掉(verify R1 #16)
+    expect(text).toContain('100.0%')        // 結束那一刻不往回掉(verify R1 #16);長條畫滿(#2)
     await ui.unmount()
   }
 
@@ -293,15 +293,16 @@ function memoryStore(on: On): Record<string, unknown> {
 /**
  * 能拒絕某一期的時鐘(`mock.clock` 不能):`clock.now` 回這裡的時間,`clock.every` 每一期掛著、時鐘走到才放行;
  * `refuse(ms, n)` 為真的那一期回 `{ deny }`(第 n 期是這個週期的第 n 次派送,跨計時器累計)。一期被拒,那個 interval 就結束。
+ * `shift()` 從 `clock.now` 回的時間扣掉:只給一次的話,只有那一次讀到的時間落在過去(`mock.clock` 的 now 不能再疊一層)。
  */
 // 測試的執行環境有 setTimeout;型別設定刻意不含 DOM 與 Node,這裡自己宣告
 declare const setTimeout: (fn: () => void, ms: number) => unknown
 
-function refusingClock(on: On, start: number, refuse: (ms: number, n: number) => boolean) {
+function refusingClock(on: On, start: number, refuse: (ms: number, n: number) => boolean, shift: () => number = () => 0) {
   let t = start
   const waits: { due: number; resolve: () => void }[] = []
   const counts = new Map<number, number>()
-  on('clock.now', () => ({ value: t }))
+  on('clock.now', () => ({ value: t - shift() }))
   on('clock.every', async (_, e) => {
     const n = (counts.get(e.ms) ?? 0) + 1
     counts.set(e.ms, n)
@@ -558,6 +559,264 @@ test('每一輪結束時先被推定結束、之後才到的 completed 通知:�
   expect((await rowText($, /Docs/))).toContain('completed')
 })
 
+test('跑完的那一列畫滿格的長條與 100.0% 再打勾,讀數只到 83% 也一樣;15 秒後收起(#2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_900_000 })
+  engineDraws(on)
+  const out = '/tmp/tasks/f2.output'
+  const log = 'tests/a.py ....  [ 83%]\n'
+  on('fs.stat', (_, e) => (e.path === out ? fileStat(log.length, 1) : noFile))
+  on('fs.read', (_, e) => ({ value: e.path === out ? log : '' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'f2')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make check', description: 'Check', run_in_background: true })
+  await clock.advance(6000)
+  const running = await rowText($, /Check/)
+  expect(shownPct(running) <= 83 + MAX_LEAD).toBe(true)         // 第 6 秒還沒越過最後讀數加 MAX_LEAD:停在離 100% 還有一段
+  await $.session.append(ended('f2'))
+  const done = await rowText($, /Check/)
+  expect(done).toContain(`▕${'█'.repeat(30)}▏`)                // 長條畫滿(BAND 的寬度是 30 格)
+  expect(done).toContain('100.0%')
+  expect(done).toContain('✓')
+  expect(done).toContain('completed')
+  await clock.advance(14_000)
+  expect(await rowText($, /Check/)).toContain('✓')             // 14 秒還在(下界:停留不到 15 秒會在這裡失敗)
+  await clock.advance(3000)
+  expect(await rowText($, /Check/)).toBe('')                   // 17 秒已收起
+})
+
+test('先被推定結束、10 秒後才收到 completed:滿格的長條從通知到的那一刻起留 15 秒(#2 verify R2)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_960_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'q2')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make slow', description: 'Slow', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束
+  await clock.advance(10_000)
+  await $.session.append(ended('q2'))
+  await clock.advance(10_000)                                    // 推定結束後 20 秒、通知後 10 秒
+  const shown = await rowText($, /Slow/)
+  expect(shown).toContain(`▕${'█'.repeat(30)}▏ 100.0% ✓`)
+  expect(shown).toContain('· completed · 6s')                    // 經過時間照舊到推定結束那一刻,不加上等通知的 10 秒(#2 verify R3)
+  expect(runsOf(mem, 'make slow').map(r => r.ms)).toEqual([6000])   // 歷史的長度照舊取推定結束那一刻
+  await clock.advance(10_000)                                    // 通知後 20 秒:收起
+  expect(await rowText($, /Slow/)).toBe('')
+})
+
+test('沒有任何讀數(只轉圈)的任務跑完也畫滿;窄的 band 上長條照寬度畫滿,經過時間照寫', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_970_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's9')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'pip install x', description: 'Install', run_in_background: true })
+  await clock.advance(5000)
+  expect(await rowText($, /Install/)).toMatch(SPINNER)          // 執行中只轉圈
+  await $.session.append(ended('s9'))
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 50 } })
+  const narrow = (await ui.find({ type: 'Text', text: /Install/ }))?.text ?? ''
+  await ui.unmount()
+  expect(narrow).toBe(`▕${'█'.repeat(10)}▏ 100.0% ✓ Install · completed · 5s`)   // 寬度下限 10 格
+})
+
+test('killed 的那一列也不畫長條', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_980_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 'k9')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make c', description: 'Job C', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('k9', 'killed'))
+  expect(await rowText($, /Job C/)).toBe('✗ Job C · killed · 3s')
+})
+
+test('failed 與推定結束的那一列不畫長條(只有 completed 畫滿)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_950_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  let id = 'x1'
+  background(on, () => id)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make a', description: 'Job A', run_in_background: true })
+  id = 'x2'
+  await $.tool.call({ tool: 'Bash', command: 'make b', description: 'Job B', run_in_background: true })
+  await clock.advance(3000)
+  await $.session.append(ended('x1', 'failed'))
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // x2 推定結束
+  const a = await rowText($, /Job A/)
+  const b = await rowText($, /Job B/)
+  expect(a).toContain('✗')
+  expect(a).not.toContain('█')
+  expect(b).toContain('ended')
+  expect(b).not.toContain('█')
+})
+
+test('先被推定結束、之後才收到 failed:打叉的列也從通知起留 15 秒,經過時間不變(#2 verify R3)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_990_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'q3')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make fail', description: 'Slow F', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  await clock.advance(10_000)
+  await $.session.append(ended('q3', 'failed'))
+  await clock.advance(10_000)                                    // 推定結束後 20 秒、通知後 10 秒
+  expect(await rowText($, /Slow F/)).toBe('✗ Slow F · failed · 6s')
+  await clock.advance(7000)                                      // 通知後 17 秒:收起
+  expect(await rowText($, /Slow F/)).toBe('')
+})
+
+test('同一則通知送到兩次:第二次不會把收起的時間再往後延(#2 verify R3)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_995_000 })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'q4')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make twice', description: 'Twice', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+  await clock.advance(10_000)
+  await $.session.append(ended('q4'))
+  await clock.advance(10_000)
+  await $.session.append(ended('q4'))                            // 同一則又來一次(transcript 裡常有重複的一筆)
+  await clock.advance(4000)                                      // 第一次通知後 14 秒:還在
+  expect(await rowText($, /Twice/)).toContain('✓')
+  await clock.advance(3000)                                      // 第一次通知後 17 秒:收起,不是從第二次算
+  expect(await rowText($, /Twice/)).toBe('')
+})
+
+test('打叉與推定結束的列寫最後顯示的百分比(#2 verify R3)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_997_000 })
+  engineDraws(on)
+  const log = 'tests/a.py ....  [ 42%]\n'
+  on('fs.stat', (_, e) => (/\/tmp\/tasks\/(f5|p5)\.output$/.test(e.path) ? fileStat(log.length, 1) : noFile))
+  on('fs.read', () => ({ value: log }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  let id = 'f5'
+  background(on, () => id)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make f5', description: 'Job F', run_in_background: true })
+  id = 'p5'
+  await $.tool.call({ tool: 'Bash', command: 'make p5', description: 'Job P', run_in_background: true })
+  await clock.advance(6000)
+  await $.session.append(ended('f5', 'failed'))
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // p5 推定結束
+  const f = await rowText($, /Job F/)
+  const p = await rowText($, /Job P/)
+  const pctOf = (t: string) => Number((t.match(/ (\d+(?:\.\d)?)% · /) ?? [])[1])
+  expect(f).toMatch(/^✗ Job F \d+(\.\d)?% · failed · 6s$/)
+  expect(p).toMatch(/^· Job P \d+(\.\d)?% · ended · 6s$/)
+  // 寫的是結束那一刻的顯示值,不是最後讀數 42(#2 verify R5:範圍同時接受兩者時,改成讀數的變異殺不掉)
+  for (const v of [pctOf(f), pctOf(p)]) expect(v > 42 && v <= 42 + MAX_LEAD + 0.5).toBe(true)
+})
+
+test('先被推定結束、之後才收到 failed:列上照舊寫推定結束那一刻的顯示值(#2 verify R5)', async ($, on) => {
+  const clock = mock.clock(on, { now: 23_000_000 })
+  engineDraws(on)
+  const log = 'tests/a.py ....  [ 42%]\n'
+  on('fs.stat', (_, e) => (e.path === '/tmp/tasks/d5.output' ? fileStat(log.length, 1) : noFile))
+  on('fs.read', () => ({ value: log }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'd5')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make d5', description: 'Job D', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束:記下這一刻的顯示值
+  const before = await rowText($, /Job D/)
+  await clock.advance(10_000)                                    // 顯示時鐘已經不再記著這個任務
+  await $.session.append(ended('d5', 'failed'))
+  const after = await rowText($, /Job D/)
+  const pctOf = (t: string) => Number((t.match(/ (\d+(?:\.\d)?)% · /) ?? [])[1])
+  expect(pctOf(before) > 42).toBe(true)
+  expect(after).toMatch(/^✗ Job D \d+(\.\d)?% · failed · 6s$/)
+  expect(pctOf(after)).toBe(pctOf(before))                       // 晚到的通知不把它換成最後讀數 42
+})
+
+test('跑不到 2 秒、先被推定結束、之後才收到 completed:不寫歷史(門檻取推定結束那一刻;#2 verify R5)', async ($, on) => {
+  const clock = mock.clock(on, { now: 24_000_000 })
+  engineDraws(on)
+  const mem = memoryStore(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  background(on, () => 'k1')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make quick', description: 'Quick', run_in_background: true })
+  await clock.advance(1500)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })   // 推定結束:跑了 1.5 秒
+  await clock.advance(3000)                                      // 通知到的時候已經過了 4.5 秒
+  await $.session.append(ended('k1'))
+  expect(runsOf(mem, 'make quick')).toEqual([])
+  expect(await rowText($, /Quick/)).toContain('100.0% ✓')
+})
+
+test('沒收到結束通知的任務:開始 6 小時後收起(#2 verify R5)', async ($, on) => {
+  // 只讓 tool.call 記下的開始時間落在 6 小時少 4 秒之前,不必把時鐘真的推 6 小時
+  let back = 0
+  const clock = refusingClock(on, 30_000_000, () => false, () => {
+    const b = back
+    back = 0
+    return b
+  })
+  engineDraws(on)
+  on('fs.stat', () => noFile)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  background(on, () => 's6')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  back = 6 * 60 * 60 * 1000 - 4000
+  await $.tool.call({ tool: 'Bash', command: 'sleep 99999', description: 'Forever', run_in_background: true })
+  await clock.advance(2000)                                      // 開始後 6 小時少 2 秒:還在
+  expect(await rowText($, /Forever/)).not.toBe('')
+  await clock.advance(4000)                                      // 開始後 6 小時又 2 秒:收起
+  expect(await rowText($, /Forever/)).toBe('')
+})
+
+test('通知剛好在 tick 讀完清單之後才到:那一列不被這一拍的舊判斷收掉(#2 verify R3)', async ($, on) => {
+  const clock = mock.clock(on, { now: 9_998_000 })
+  engineDraws(on)
+  let armed = false
+  on('fs.stat', async (_, e) => {
+    if (armed && e.path === '/tmp/tasks/b8.output') {
+      armed = false                          // a8 已經在這一拍被判成要收起,通知在 b8 讀檔的時候才到
+      await $.session.append(ended('a8'))
+    }
+    return noFile
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('classic.Stop', () => ({}))
+  let id = 'a8'
+  background(on, () => id)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'make a8', description: 'Job A8', run_in_background: true })
+  id = 'b8'
+  await $.tool.call({ tool: 'Bash', command: 'make b8', description: 'Job B8', run_in_background: true })
+  await clock.advance(6000)
+  await $.classic.Stop({ stop_hook_active: false,
+    background_tasks: [{ id: 'b8', type: 'shell', status: 'running', description: 'Job B8', command: 'make b8' }] })
+  await clock.advance(14_000)                                    // a8 推定結束後 14 秒:還在
+  expect(await rowText($, /Job A8/)).toContain('ended')
+  armed = true
+  await clock.advance(2000)                                      // 下一拍:a8 超過 15 秒,讀 b8 的時候通知到
+  expect(await rowText($, /Job A8/)).toContain(`100.0% ✓ Job A8 · completed · 6s`)
+})
 
 test('同一個指令同時跑完兩次:兩次都記下,不互蓋(verify R2 #1)', async ($, on) => {
   const clock = mock.clock(on, { now: 11_000_000 })
@@ -741,6 +1000,7 @@ test('結束通知剛好插在推定結束的兩次寫入之間:照樣寫進歷�
     const v = (e.value as { value?: { id: string; presumed: boolean }[] } | undefined)?.value
     if (armed && e.plugin === 'progress-bar' && e.key === 'tasks' && Array.isArray(v) && v.some(x => x.id === 'x1' && x.presumed)) {
       armed = false                          // 推定結束的任務剛寫進去、待寫清單還沒寫:通知在這裡到
+      await clock.advance(4000)              // 而且晚 4 秒到:長度要取推定結束那一刻,不是通知到的那一刻(#2 verify R3)
       await $.session.append(ended('x1'))
     }
     return r

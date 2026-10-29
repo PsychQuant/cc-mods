@@ -8,7 +8,8 @@ import {
 } from './est'
 import { bar, elapsed, etaText, expandPath, pct, readProgress, redirectTargets } from './parse'
 
-// 欄位改了就換 shape:舊版存的值會被拒收,不會被讀成錯的形狀(重載之後 $.state 還在)
+// 欄位改了就換 shape:舊版存的值會被拒收,不會被讀成錯的形狀(重載之後 $.state 還在)。
+// 新增選填欄位(舊值沒有它也讀得對,例如 keepFrom)不換:換了會在重載時清空清單,正在跑的任務只能等下一輪以「接上」回來
 const tasks = atom({ plugin: 'progress-bar', key: 'tasks' } as const, [] as Tracked[], { shape: 'tasks-4' })
 // 每一拍寫一次現在的時間,讓經過時間跟著重畫
 const now = atom({ plugin: 'progress-bar', key: 'now' } as const, 0)
@@ -24,7 +25,7 @@ const POLL_STALE_MS = 3 * POLL_MS      // 輪詢時鐘這麼久沒跑,顯示時�
 const DISPLAY_MS = 250                 // 顯示時鐘:只算、不讀檔
 const STALE_FRAME_MS = 1000            // 顯示時鐘這麼久沒跑,2 秒的 tick 就重開它(verify R1 #2、#6)
 const SPIN_MS = 1000                   // 轉圈每秒一格:轉圈列 shown 每秒最多寫一次(verify R1 #13)
-const KEEP_DONE_MS = 15_000            // 結束後再顯示多久
+const KEEP_DONE_MS = 15_000            // 結束後再顯示多久;推定結束之後才收到通知的,從通知到的那一刻算(keepFrom)
 const STALE_MS = 6 * 60 * 60 * 1000    // 沒收到結束通知的任務(與待寫的歷史),最多留多久
 const MAX_TASKS = 6
 const MAX_TRIES = 3                    // 一次跑完的長度寫不進 store,最多試幾次
@@ -270,6 +271,12 @@ function shownD(id: string): number | null {
   return w === undefined || w.spin ? null : w.d
 }
 
+/** 這一列該收起了:結束(或推定結束後收到通知)超過 KEEP_DONE_MS,或開始超過 STALE_MS。keepFrom 是舊狀態沒有的欄位 */
+const isGone = (x: Tracked, t: number): boolean => {
+  const from = x.keepFrom ?? x.endedAt
+  return (from !== null && t - from > KEEP_DONE_MS) || t - x.startedAt > STALE_MS
+}
+
 /** 讀一次每個還在跑(或剛結束)的任務的檔,有變才寫回;重試寫不進的歷史;看顯示時鐘還在不在跑。 */
 async function tick($: EngineInterface, gen: number): Promise<void> {
   const t = await $.clock.now()
@@ -285,12 +292,12 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
   // 這一拍讀到的 mtime 先記在這裡,讀數寫回去了才併進 mtimes:讀檔失敗、或這一拍已經被換掉時,下一拍還會再讀(verify R3 #2)
   const seen = new Map<string, number>()
   for (const task of list) {
-    const isOver = task.endedAt !== null && t - task.endedAt > KEEP_DONE_MS
-    if (isOver || t - task.startedAt > STALE_MS) {
+    if (isGone(task, t)) {
       drop.add(task.id)
       continue
     }
-    // 結束之後再讀一兩拍,最後的百分比(常常是 100%)才會畫上去
+    // 結束之後再讀一兩拍:failed、killed、推定結束的列寫最後顯示的百分比(final);結束時還沒畫過(final 是 null)才用
+    // 這一拍讀到的讀數。completed 的列一律畫滿,不靠這一拍
     if (task.endedAt !== null && t - task.endedAt > 2 * POLL_MS) continue
     let cur: Tracked = task
     for (const f of task.files) {
@@ -322,7 +329,8 @@ async function tick($: EngineInterface, gen: number): Promise<void> {
     await update($, tasks, latest => {
       if (gen !== pollGen) return latest
       committed = true
-      return latest.filter(x => !drop.has(x.id)).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x))
+      // 只收掉現在仍該收的:讀檔的時候結束通知可能剛到,那一列的收起時間已經往後延(#2 verify R3)
+      return latest.filter(x => !(drop.has(x.id) && isGone(x, t))).map(x => (patch.has(x.id) ? { ...x, ...patch.get(x.id) } : x))
     })
   }
   if (!committed || gen !== pollGen) return
@@ -385,9 +393,12 @@ function isSpin(x: Tracked, s: Shown | undefined): boolean {
 function row(x: Tracked, s: Shown | undefined, t: number, width: number): string {
   const took = elapsed((x.endedAt ?? t) - x.startedAt)
   if (x.endedAt !== null) {
-    const mark = x.status === 'completed' ? '✓' : x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
-    // 結束那一刻不往回掉:completed 寫 100%,其餘寫最後的顯示值(verify R1 #16)
-    const last = x.status === 'completed' && (x.percent !== null || x.final !== null) ? 100 : x.final ?? x.percent
+    // 跑完的那一列把長條畫滿再打勾(#2):讀數稀疏時,執行中的長條常停在離 100% 還有一段的地方(目標最多領先
+    // MAX_LEAD,只有最低速度那一項會慢慢越過),只換成一行文字的話,長條從來沒畫滿,看起來像沒跑完
+    if (x.status === 'completed') return `▕${bar(100, width)}▏ ${pct(100)} ✓ ${x.label} · completed · ${took}`
+    const mark = x.status === 'failed' || x.status === 'killed' ? '✗' : '·'
+    // 結束那一刻不往回掉:寫最後的顯示值(verify R1 #16)
+    const last = x.final ?? x.percent
     const p = last === null ? '' : ` ${Math.round(last * 10) / 10}%`
     return `${mark} ${x.label}${p} · ${x.status ?? 'ended'} · ${took}`
   }
@@ -543,8 +554,11 @@ export const register: Register = on => {
       // 推定結束了的也建:每一輪結束時先寫任務、再寫待寫清單,通知可能剛好插在中間(verify R3 #1)。長度用推定結束的那一刻
       const fresh = list.filter(x => open(x) && recordable(x, x.endedAt ?? t))
         .map(x => pendingOf(x, x.endedAt ?? t, ends.get(x.id) ?? null))
+      // 收起前的 15 秒從通知到的那一刻算(keepFrom):推定結束之後才收到通知的,滿格的長條才看得到(#2 verify R2)。
+      // 結束時間不改 —— 畫面上的經過時間與歷史的長度一樣,到推定結束那一刻(verify R3)。
+      // 同一則通知又來一次時 open() 不成立(presumed 已清掉),不會再往後延
       await update($, tasks, l => l.map(x => (open(x)
-        ? { ...x, endedAt: x.endedAt ?? t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
+        ? { ...x, endedAt: x.endedAt ?? t, keepFrom: t, status: ends.get(x.id) ?? null, presumed: false, final: x.final ?? shownD(x.id) }
         : x)))
       await update($, pending, latest => capPending([
         ...latest.map(p => (ends.has(p.id) && p.status === null ? { ...p, status: ends.get(p.id) ?? null } : p)),

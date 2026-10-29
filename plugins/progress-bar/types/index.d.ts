@@ -54,8 +54,10 @@ export type Tracked = {
   phase: number
   /** 輸出的最後一行(截短) */
   line: string
-  /** 任務結束的時間;還在跑是 null */
+  /** 任務結束的時間(推定結束的列是推定的那一刻,之後收到通知也不改);還在跑是 null */
   endedAt: number | null
+  /** 收起前的 15 秒從這一刻算:收到結束通知的那一刻;沒有(還沒收到通知,或舊版存的狀態)就用 endedAt */
+  keepFrom?: number | null
   /** 結束時的狀態(completed、failed、killed;每一輪結束時清單裡沒有了是 ended);還在跑是 null */
   status: string | null
   /** 只是從背景清單推定結束,還沒收到結束通知 */
@@ -65,7 +67,7 @@ export type Tracked = {
 }
 
 /**
- * 一次跑完、還沒寫進歷史的長度。與顯示的任務清單分開放:任務結束 15 秒後就從畫面收起,
+ * 一次跑完、還沒寫進歷史的長度。與顯示的任務清單分開放:任務結束(或收到晚到的結束通知)15–17 秒後就從畫面收起,
  * 晚到的結束通知仍找得到這一筆(verify R2 #3)。
  */
 export type Pending = {
